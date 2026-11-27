@@ -58,6 +58,10 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let fsr = fsr_4k::FsrPreset::requested()?;
+    // What this PC is, the console profile when `--console` is not given,
+    // and the defaults of a smaller PC (`host_preset.rs`), before anything
+    // reads the switches it sets.
+    let console = crate::host_preset::apply(console, fsr.map(|preset| preset.render_size()));
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
     let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
@@ -69,7 +73,10 @@ pub fn run(
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
     let image = if let Some(preset) = fsr {
-        anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
+        anyhow::ensure!(
+            console == victory_hle::console::Console::SeriesX,
+            "FSR 4K requires Series X mode"
+        );
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
         fsr_4k::check_host_card()?;
         let dir = cfg.fidelityfx_dir.as_deref().context(
@@ -124,10 +131,7 @@ pub fn run(
     let temp = cfg.data_subdir(&format!("{:08X}/temp", title.id))?;
     victory_hle::modules::files::mount_at('T', &temp);
     victory_hle::runtime::set_title(victory_hle::runtime::Title { storage, ..title });
-    victory_hle::console::set(match console {
-        Console::SeriesX => victory_hle::console::Console::SeriesX,
-        Console::SeriesS => victory_hle::console::Console::SeriesS,
-    });
+    victory_hle::console::set(console);
     println!("console        {}", victory_hle::console::current().name());
     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
     for (name, dll) in &dlls {
