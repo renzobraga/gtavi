@@ -7856,6 +7856,10 @@ impl HostList {
                         crate::port_journal::prep_wrote();
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
+                    // Renderer port #2: the view records it put there.
+                    if crate::port_descriptors::on() {
+                        crate::port_descriptors::mark_written(dst, len);
+                    }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
                     // What the card holds there may be another value although
@@ -7895,6 +7899,11 @@ impl HostList {
                     }
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
+                    }
+                    // Renderer port #2: the view records it put there (a copy
+                    // left to the card marks the slots that held views).
+                    if crate::port_descriptors::on() {
+                        crate::port_descriptors::mark_written(p.dst, p.len);
                     }
                     (started, p.len)
                 }

@@ -12,8 +12,9 @@
 //!   not set and said once with its reason ([`defaults`]). A value set by
 //!   hand always stays.
 //! - Warnings, which refuse nothing: a commit limit too low for a run on a PC
-//!   with little RAM, and a render size whose tile lists a card other than
-//!   AMD's runs cut unless `VICTORY_INDIRECT_WIDE=1` ([`warnings`]).
+//!   with little RAM, and on a card other than AMD's renderer patch 5 asked
+//!   for and a render size whose tile lists it runs cut unless
+//!   `VICTORY_INDIRECT_WIDE=1` ([`warnings`]).
 //!
 //! `VICTORY_HOST_PRESET=0`: none of it (Series X unless `--console` says
 //! otherwise, no defaults, as before the preset); what the PC is and the
@@ -359,8 +360,9 @@ fn port_cbv(env: &dyn Fn(&str) -> Option<String>) -> bool {
 
 /// The warnings, which refuse nothing: on a PC with little RAM a commit
 /// limit under the RAM and [`COMMIT_ABOVE_RAM`], and on a card other than
-/// AMD's a render size of more tiles than [`MOST_GROUPS`] (not with
-/// [`wide`]).
+/// AMD's renderer patch 5 asked for ([`port_cbv`]) and a render size of more
+/// tiles than [`MOST_GROUPS`] (not with [`wide`], nor with -Fsr4K, which is
+/// refused there unless [`any_provider`]).
 fn warnings(
     probe: &Probe,
     console: Profile,
@@ -408,9 +410,14 @@ fn warnings(
         if tiles > MOST_GROUPS {
             let lower = if fsr_input.is_some() {
                 "VICTORY_FSR_4K=performance (play.ps1 -Fsr4K performance: 1920x1080 in)"
+            } else if console == Profile::SeriesS || env("VICTORY_OUTPUT").is_some() {
+                // (The size comes from the output asked for, whichever profile.)
+                "a smaller VICTORY_OUTPUT (play.ps1 -Output 1920x1080: 1280x720 in, or \
+                 -Output 2560x1440: 1706x960)"
             } else {
                 "--console series-s (play.ps1 -Console series-s: 1280x720), or on Series X \
-                 VICTORY_OUTPUT=2560x1440 (1706x960) or VICTORY_OUTPUT=1920x1080 (1280x720)"
+                 VICTORY_OUTPUT=2560x1440 (1706x960) or VICTORY_OUTPUT=1920x1080 (1280x720) \
+                 (play.ps1 -Output)"
             };
             out.push(format!(
                 "the title renders at {}x{}, {tiles} tiles of 8x4 pixels, and on a card other than \
@@ -982,6 +989,23 @@ mod tests {
         };
         let d = decide(&amd, &auto(), &cbv);
         assert!(!d.warnings.iter().any(|w| w.contains("VICTORY_PORT_CBV")));
+    }
+
+    #[test]
+    fn a_large_output_on_series_s_is_told_to_be_smaller() {
+        let output = |name: &str| (name == "VICTORY_OUTPUT").then(|| "3840x2160".to_owned());
+        let d = decide(&small_pc(), &auto(), &output);
+        assert_eq!(d.console, Profile::SeriesS);
+        let tile = d
+            .warnings
+            .iter()
+            .find(|w| w.contains("tiles"))
+            .expect("a tile warning");
+        assert!(
+            tile.contains("2560x1440") && tile.contains("-Output 1920x1080"),
+            "{tile}"
+        );
+        assert!(!tile.contains("--console series-s"), "{tile}");
     }
 
     #[test]

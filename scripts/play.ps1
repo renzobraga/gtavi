@@ -7,8 +7,10 @@
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance; Series X)
 # -Vrr          tearing allowed, so that a G-SYNC or FreeSync display follows the frame rate in a window
 # -Perf         renderer patches 2, 6 and 7 (README.md): less work for the submitting thread, on any card;
-#               patch 5 stays off (AMD's in effect), patch 1 is left to -More (it moves reads to the bus)
+#               patch 5 stays off (AMD's in effect), patch 1 is left to -More (it moves reads to the bus).
+#               Their figures were measured with patches 1 and 5 on, on AMD: 2, 6 and 7 alone are untried
 # -Output       the title's output size, one of its modes (VICTORY_OUTPUT): smaller is less card time
+#               (not with -Fsr4K, whose output is 3840x2160)
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}; -More @{VICTORY_HOST_PRESET='0'} leaves out
 #               what the launcher and this script choose for a smaller PC (the launcher says each
@@ -56,7 +58,8 @@ if ($Vrr) { $settings.VICTORY_TEARING = '1' }
 # pipelines made without them still serve. -Safe stays without them.)
 if ($Perf -and $Safe) { Write-Host '-Perf left out with -Safe.' }
 elseif ($Perf) { $settings.VICTORY_PORT_DESCRIPTORS = '1'; $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_JOURNAL = '1' }
-if ($Output) { $settings.VICTORY_OUTPUT = $Output }
+if ($Output -and $Fsr4K) { Write-Host '-Output left out with -Fsr4K.' }
+elseif ($Output) { $settings.VICTORY_OUTPUT = $Output }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

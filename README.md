@@ -134,8 +134,10 @@ Untested on such a PC so far. The launcher says what the PC is when it starts
 `play.ps1`; what the layer adapts by itself stays (the guide lists the switches
 for a run near the one before).
 `-Perf` turns on renderer patches 2, 6 and 7, which save the submitting
-thread's time on any card (patch 5 needs the view heaps of an AMD card), and
-`-Output 1664x936` or `1280x720` lowers the card's work.
+thread's time and depend on no card's own (patch 5 needs the view heaps of an
+AMD card); their figures are of runs with patches 1 and 5 on as well, and the
+three alone are untried. `-Output 1664x936` or `1280x720` lowers the card's
+work.
 `-Vrr` lets a G-SYNC or FreeSync display follow the frame rate. `-Fsr4K` needs
 an RDNA 4 Radeon and is refused at once elsewhere. A fixed paging file of
 32768 MB or more is needed. The steps, every new switch and what to measure:

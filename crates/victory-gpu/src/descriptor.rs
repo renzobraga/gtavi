@@ -441,8 +441,30 @@ pub(crate) fn sync_heaps() {
                 spent[0] += since(began);
                 crate::port_descriptors::asked(&taken);
             }
+            // (A page looked at whole leaves out the runs of marks taken
+            // above, which their own parts compare: so no record is in two
+            // parts that run at once, and a record told and taken this round
+            // is not counted as one no store told of. The runs are in
+            // order and apart, as `take` makes them.)
+            let marked: Vec<(usize, usize)> = parts.iter().map(|&(from, to, _)| (from, to)).collect();
             for page in crate::port_descriptors::to_check(frame) {
-                parts.push((page.max(start as usize), (page + crate::watch::PAGE).min(end as usize), true));
+                let (mut from, to) = (page.max(start as usize), (page + crate::watch::PAGE).min(end as usize));
+                let mut i = marked.partition_point(|&(_, run_end)| run_end <= from);
+                while from < to {
+                    match marked.get(i) {
+                        Some(&(run, run_end)) if run < to => {
+                            if from < run {
+                                parts.push((from, run, true));
+                            }
+                            from = from.max(run_end);
+                            i += 1;
+                        }
+                        _ => {
+                            parts.push((from, to, true));
+                            break;
+                        }
+                    }
+                }
             }
         } else {
             let began = std::time::Instant::now();

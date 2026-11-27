@@ -398,6 +398,41 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
     out
 }
 
+/// Our own write of `len` bytes at `at` (a copy of a submission's, done on
+/// the CPU), if it touches the marked heap: each slot whose first word lies
+/// in it and is now a view's is marked, as the title's `memcpy` marks them
+/// ([`copied`]). Without it the records round under the switch looks only
+/// at marked slots and the fallback's few pages, so a view record our copy
+/// put there waited for the fallback, up to many frames, and a draw that
+/// picked it by index read the old one. Read by a copy that fails where
+/// title memory is not there (`crate::host::read_there`: zeros, no view).
+pub(crate) fn mark_written(at: usize, len: usize) {
+    let heap = MARKS.len.load(Acquire);
+    if heap == 0 || len < 4 {
+        return;
+    }
+    let start = MARKS.start.load(Relaxed);
+    let (lo, hi) = ((at as u64).max(start), (at as u64).saturating_add(len as u64).min(start + heap));
+    if lo >= hi {
+        return;
+    }
+    let first = (lo - start).div_ceil(32);
+    let from = start + first * 32;
+    if from + 4 > hi {
+        return;
+    }
+    let mut bytes = vec![0u8; (hi - from) as usize];
+    crate::host::read_there(from as *const u8, &mut bytes);
+    let mut marked = 0;
+    for (i, record) in bytes.chunks(32).enumerate() {
+        if record.starts_with(&crate::descriptor::VIEW_TAG.to_le_bytes()) {
+            mark_slot(first as usize + i);
+            marked += 1;
+        }
+    }
+    MARKED_BY_US.fetch_add(marked, Relaxed);
+}
+
 /// Marks slot `slot` of the marked heap (in it: checked by the caller).
 #[inline]
 fn mark_slot(slot: usize) {
