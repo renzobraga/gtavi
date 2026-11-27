@@ -304,8 +304,29 @@ fn back_list(kind: u32) -> This {
     list
 }
 
+/// How many threads translate lists: `asked` (`VICTORY_THIN_THREADS`, 1 to
+/// 32), else 8; on a small processor (`crate::cores::small_cpu`) one less
+/// than its cores, at least 4 (5 on a Ryzen 5 7600X).
+///
+/// Eight were counted for 24 logical processors (eight fast cores). They
+/// run at normal priority beside the title's five recording threads, whose
+/// calls they translate, and beside the threads of ours a frame waits for:
+/// on six cores of two threads that is more threads that want a processor
+/// than there are, and the translating ones win as often as the others.
+/// Not measured there yet: `VICTORY_THIN_THREADS=8` is the other side of
+/// the A/B.
+fn thin_threads(asked: Option<usize>, small: bool, cores: usize) -> usize {
+    match asked {
+        Some(n) => n.clamp(1, 32),
+        None if small => cores.saturating_sub(1).max(4),
+        None => 8,
+    }
+}
+
 fn start() {
-    let threads = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(8usize).clamp(1, 32);
+    let asked = std::env::var("VICTORY_THIN_THREADS").ok().and_then(|v| v.trim().parse().ok());
+    let small = crate::cores::small_cpu();
+    let threads = thin_threads(asked, small, if small { crate::cores::physical_cores() } else { 0 });
     for i in 0..threads {
         let worker = move || {
             crate::cores::keep_many_on_fast_cores("victory-list");
@@ -888,6 +909,21 @@ const MINE: [(usize, *const ()); 50] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_small_processor_translates_on_one_thread_less_than_its_cores() {
+        // The i9-12900K: eight, as before.
+        assert_eq!(thin_threads(None, false, 0), 8);
+        // A Ryzen 5 7600X; a four-core processor.
+        assert_eq!(thin_threads(None, true, 6), 5);
+        assert_eq!(thin_threads(None, true, 4), 4);
+        assert_eq!(thin_threads(None, true, 0), 4);
+        // Asked for: that, on either.
+        assert_eq!(thin_threads(Some(8), true, 6), 8);
+        assert_eq!(thin_threads(Some(3), false, 0), 3);
+        assert_eq!(thin_threads(Some(0), false, 0), 1);
+        assert_eq!(thin_threads(Some(99), true, 6), 32);
+    }
 
     /// Every method of the tables that records is written down too: what is
     /// left in both tables alike records nothing.

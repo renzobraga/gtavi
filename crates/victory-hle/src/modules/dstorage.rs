@@ -322,11 +322,10 @@ struct Files {
 
 impl Files {
     fn new(first: std::fs::File, io: Io) -> Files {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
         let others = match io {
             Io::One => 0,
             Io::Overlapped => 1,
-            Io::Handles | Io::Direct => workers,
+            Io::Handles | Io::Direct => workers(),
         };
         Files { first, others: (0..others).map(|_| OnceLock::new()).collect(), io }
     }
@@ -599,6 +598,41 @@ struct Job {
 // SAFETY: as for `Lane`.
 unsafe impl Send for Job {}
 
+/// How many workers run the requests, and how many handles a file gets
+/// ([`Io::Handles`]): `VICTORY_DSTORAGE_WORKERS` (1 to 64) if given, else
+/// every logical processor, as before; on a small processor
+/// (`victory_gpu::small_cpu`: under 16 logical ones) its cores less two, at
+/// least 2 (4 on a Ryzen 5 7600X, where it was 12).
+///
+/// They inflate zlib and unpack BCPack on the processor, which the
+/// console's hardware does beside its cores, so a burst of streaming can keep
+/// all of them busy at normal priority beside the title's threads and ours.
+/// With 24 logical processors that left room; with 12, twelve of them could
+/// take every one while a frame waits. They stay at normal priority all
+/// the same: the title's loads wait for them, and a thread below the busy
+/// ones got a processor once in seconds (`super::kernel`'s
+/// `title_priority`). The debug line every 5 s says how many were busy
+/// (`busy_workers`, `bcpack_workers`): near the count while the title
+/// streams, more of them are wanted.
+fn workers() -> usize {
+    static WORKERS: OnceLock<usize> = OnceLock::new();
+    *WORKERS.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DSTORAGE_WORKERS").ok().and_then(|v| v.trim().parse().ok());
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let small = victory_gpu::small_cpu();
+        worker_count(asked, logical, small, if small { victory_gpu::physical_cores() } else { 0 })
+    })
+}
+
+/// [`workers`], of `logical` processors and `cores`.
+fn worker_count(asked: Option<usize>, logical: usize, small: bool, cores: usize) -> usize {
+    match asked {
+        Some(n) => n.clamp(1, 64),
+        None if small => cores.saturating_sub(2).max(2).min(logical),
+        None => logical,
+    }
+}
+
 /// The scheduler, with its workers started on first use; `None` if not
 /// even one worker could start.
 fn scheduler() -> Option<&'static Scheduler> {
@@ -628,8 +662,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let started = (0..workers)
+        let started = (0..workers())
             .filter(|i| {
                 std::thread::Builder::new()
                     .name(format!("dstorage {i}"))
@@ -1768,6 +1801,20 @@ mod tests {
 
     use super::*;
     use crate::modules::xgameruntime::method;
+
+    #[test]
+    fn a_small_processor_streams_on_its_cores_less_two() {
+        // The i9-12900K: every logical processor, as before.
+        assert_eq!(worker_count(None, 24, false, 0), 24);
+        // A Ryzen 5 7600X; four cores; two.
+        assert_eq!(worker_count(None, 12, true, 6), 4);
+        assert_eq!(worker_count(None, 8, true, 4), 2);
+        assert_eq!(worker_count(None, 2, true, 2), 2);
+        assert_eq!(worker_count(None, 1, true, 1), 1);
+        // Asked for: that.
+        assert_eq!(worker_count(Some(12), 12, true, 6), 12);
+        assert_eq!(worker_count(Some(0), 24, false, 0), 1);
+    }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
         // SAFETY: every object here starts with the runtime header.

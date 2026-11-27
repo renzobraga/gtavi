@@ -517,7 +517,8 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            let (processors, cores) = processors();
+            (worker_count(None, processors, cores) / 4).max(1)
         }
     })
 }
@@ -633,11 +634,27 @@ fn next(screens_only: bool) -> Arc<Pending> {
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
 /// title's own threads, and a cold cache queues hundreds at once.
-fn worker_count(asked: Option<usize>, processors: usize) -> usize {
+///
+/// On a small processor (`crate::cores::small_cpu`: under 16 logical ones)
+/// two less than its `cores`, at least 2: 4 on a Ryzen 5 7600X, where two
+/// thirds were 8, and with the two for passes over the screen
+/// ([`SCREEN_WORKERS`]) as many as it has cores. Below the title's threads
+/// they take no processor the others want, but a compile on a core's second
+/// thread slows whatever runs on its first, and with a cold cache all of
+/// them compile for minutes: on six cores, ten would be on every core. The slow
+/// ones get a quarter of these ([`slow_limit`]: 1 there). Not measured there
+/// yet; `VICTORY_PIPELINE_WORKERS=8` is as before.
+fn worker_count(asked: Option<usize>, processors: usize, cores: usize) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
+        None if crate::cores::small_cpu_of(processors) => cores.saturating_sub(2).max(2),
         None => (processors * 2 / 3).clamp(2, 16),
     }
+}
+
+/// The logical processors and the cores, for [`worker_count`].
+fn processors() -> (usize, usize) {
+    (std::thread::available_parallelism().map_or(2, |n| n.get()), crate::cores::physical_cores())
 }
 
 /// Starts the workers ([`worker_count`]) on first use.
@@ -645,11 +662,13 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
+        let (processors, cores) = processors();
         let workers = worker_count(
             std::env::var("VICTORY_PIPELINE_WORKERS")
                 .ok()
                 .and_then(|v| v.trim().parse().ok()),
-            std::thread::available_parallelism().map_or(2, |n| n.get()),
+            processors,
+            cores,
         );
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
@@ -733,11 +752,19 @@ mod tests {
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {
-        assert_eq!(worker_count(None, 1), 2);
-        assert_eq!(worker_count(None, 24), 16);
-        assert_eq!(worker_count(None, 64), 16);
-        assert_eq!(worker_count(Some(0), 24), 1);
-        assert_eq!(worker_count(Some(20), 24), 20);
+        assert_eq!(worker_count(None, 1, 1), 2);
+        assert_eq!(worker_count(None, 24, 16), 16);
+        assert_eq!(worker_count(None, 64, 32), 16);
+        assert_eq!(worker_count(Some(0), 24, 16), 1);
+        assert_eq!(worker_count(Some(20), 24, 16), 20);
+        // Sixteen logical processors and more: two thirds, as before.
+        assert_eq!(worker_count(None, 16, 8), 10);
+        // A small processor: two less than its cores (a Ryzen 5 7600X: 4), at
+        // least 2; the switch still wins.
+        assert_eq!(worker_count(None, 12, 6), 4);
+        assert_eq!(worker_count(None, 8, 4), 2);
+        assert_eq!(worker_count(None, 4, 4), 2);
+        assert_eq!(worker_count(Some(8), 12, 6), 8);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the

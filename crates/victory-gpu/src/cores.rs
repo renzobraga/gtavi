@@ -1,6 +1,86 @@
 //! Which processors our own threads run on, where a processor has two kinds
 //! of cores. `cpu_sets` and `keep_on_fast_cores` are fxceless/victory-fork's
 //! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this).
+//!
+//! Also what our pools are sized by on a processor with few of them
+//! ([`small_cpu`], [`physical_cores`]).
+
+/// Logical processors under which a processor counts as a small one: the
+/// threads of ours were counted for 24 (i9-12900K), and a six-core processor
+/// with two threads a core (Ryzen 5 7600X) has 12.
+const SMALL_CPU: usize = 16;
+
+/// Whether `logical` processors make a small one ([`SMALL_CPU`]).
+pub(crate) fn small_cpu_of(logical: usize) -> bool {
+    logical < SMALL_CPU
+}
+
+/// Whether this processor is a small one: fewer than 16 logical processors
+/// (`std::thread::available_parallelism`; not known: not small). Pools of
+/// ours that were sized for 24 are sized by the cores there are where it is,
+/// and some of our helpers run at another priority; each says so where it
+/// is sized. A `VICTORY_...` switch given for one of them wins.
+pub fn small_cpu() -> bool {
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SMALL.get_or_init(|| {
+        let small = std::thread::available_parallelism().is_ok_and(|n| small_cpu_of(n.get()));
+        if small {
+            tracing::info!(
+                logical = std::thread::available_parallelism().map_or(0, |n| n.get()),
+                cores = physical_cores(),
+                "a small processor: our pools are sized by its cores"
+            );
+        }
+        small
+    })
+}
+
+/// The cores of group 0 (each once, however many logical processors it
+/// runs: two on most desktop processors), once; where they cannot be told,
+/// half the logical processors.
+pub fn physical_cores() -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CORES.get_or_init(|| match cores_of_group_0() {
+        0 => (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).max(1),
+        n => n,
+    })
+}
+
+/// The system's core records of group 0, counted (none known: 0).
+fn cores_of_group_0() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut bytes) };
+    // A core's record (48 bytes) is shorter than the structure, which is as
+    // long as the longest kind (80): room for one past the last record, so
+    // that the last is read whole and counted.
+    let room = (bytes as usize + size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()).div_ceil(8);
+    let mut buffer = vec![0u64; room];
+    // SAFETY: as above; the buffer holds `bytes` bytes and more, aligned for
+    // the records.
+    let ok = unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, buffer.as_mut_ptr().cast(), &mut bytes) };
+    let mut cores = 0;
+    let mut at = 0usize;
+    // (A record's kind and size are its first eight bytes.)
+    while ok != 0 && at + 8 <= bytes as usize {
+        // SAFETY: a record inside the buffer, which has room for the
+        // structure past its start; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: a core's record (the kind asked for), with its first
+        // group mask.
+        if info.Relationship == RelationProcessorCore && unsafe { info.Anonymous.Processor.GroupMask[0].Group } == 0 {
+            cores += 1;
+        }
+        at += info.Size as usize;
+    }
+    cores
+}
 
 /// The system's processor sets of group 0: each one's id, its efficiency
 /// class (higher is faster) and its core (which two of them may share).
@@ -320,6 +400,18 @@ mod tests {
         // A larger cache of under eight sets: nothing.
         let few: Vec<(u32, u32)> = (0..32).map(|i| (256 + i, if i < 4 { 64 * MB } else { 32 * MB })).collect();
         assert!(fast_by_cache(&sets, &few).is_empty());
+    }
+
+    #[test]
+    fn a_small_processor_is_one_of_fewer_than_sixteen_threads() {
+        // A Ryzen 5 7600X; an eight-core processor of two threads a core;
+        // the i9-12900K.
+        assert!(small_cpu_of(12));
+        assert!(!small_cpu_of(16));
+        assert!(!small_cpu_of(24));
+        let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert!((1..=logical).contains(&physical_cores()));
+        assert_eq!(small_cpu(), small_cpu_of(logical));
     }
 
     #[test]
