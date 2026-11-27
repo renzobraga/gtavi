@@ -351,6 +351,12 @@ fn any_provider(env: &dyn Fn(&str) -> Option<String>) -> bool {
     env("VICTORY_FSR_ANY_PROVIDER").as_deref() == Some("1")
 }
 
+/// `VICTORY_PORT_CBV=1`, read as `victory-shader` reads it (`constants_raw`:
+/// `1` once trimmed): renderer patch 5.
+fn port_cbv(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env("VICTORY_PORT_CBV").is_some_and(|v| v.trim() == "1")
+}
+
 /// The warnings, which refuse nothing: on a PC with little RAM a commit
 /// limit under the RAM and [`COMMIT_ABOVE_RAM`], and on a card other than
 /// AMD's a render size of more tiles than [`MOST_GROUPS`] (not with
@@ -377,6 +383,20 @@ fn warnings(
             gib(m.commit_free),
             gib(m.total + COMMIT_ABOVE_RAM),
         ));
+    }
+    // Renderer patch 5 reads constant buffers through raw twins of their
+    // views, which need a view heap of 2^22: a card that is not AMD's caps
+    // its heaps at 1,000,000 (victory-gpu `descriptor/host.rs`, `raw_twins`).
+    // There it changes only root constant buffers, into one-view tables that
+    // take the dynamic slots whose want already drops draws.
+    if probe.not_amd() && port_cbv(env) {
+        out.push(
+            "VICTORY_PORT_CBV=1 (renderer patch 5) on a card that is not AMD's: its view heaps \
+             hold 1,000,000 views, too few for the raw views the patch reads constant buffers \
+             through, so it saves nothing here and may drop more draws (the log's 'raw_twins'); \
+             leave it off (play.ps1 -Perf does)"
+                .to_owned(),
+        );
     }
     // (With -Fsr4K on such a card the launcher refuses the run a moment
     // later, `fsr_4k::check_host_card`, unless VICTORY_FSR_ANY_PROVIDER=1:
@@ -938,6 +958,30 @@ mod tests {
             "{:?}",
             d.warnings
         );
+    }
+
+    #[test]
+    fn patch_5_is_warned_of_on_a_card_that_is_not_amds() {
+        let cbv = |name: &str| (name == "VICTORY_PORT_CBV").then(|| " 1 ".to_owned());
+        let d = decide(&small_pc(), &auto(), &cbv);
+        assert!(
+            d.warnings.iter().any(|w| w.contains("VICTORY_PORT_CBV=1")),
+            "{:?}",
+            d.warnings
+        );
+        let d = decide(&small_pc(), &auto(), &none);
+        assert!(!d.warnings.iter().any(|w| w.contains("VICTORY_PORT_CBV")));
+        let amd = Probe {
+            adapter: Some(Adapter {
+                name: "AMD Radeon RX 7900 XTX".to_owned(),
+                vendor: AMD,
+                device: 0x744c,
+                dedicated: 24 * GIB,
+            }),
+            ..small_pc()
+        };
+        let d = decide(&amd, &auto(), &cbv);
+        assert!(!d.warnings.iter().any(|w| w.contains("VICTORY_PORT_CBV")));
     }
 
     #[test]

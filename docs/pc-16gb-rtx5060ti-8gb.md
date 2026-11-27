@@ -17,6 +17,15 @@ um monitor de taxa variável (G-SYNC / FreeSync, aqui um TCL de 300 Hz).
   Em placas NVIDIA, o que falha agora avisa por quê, em vez de falhar calado.
 - Tudo é automático e respeita o que você definir à mão: qualquer `VICTORY_...`
   que você passar vale mais que a escolha do launcher.
+- **Quantos fps, numa estimativa (não medida):** no PC de desenvolvimento, o
+  melhor resultado é cerca de 22 fps numa rua da cidade. Aqui a placa tem mais
+  ou menos metade da força, então espere **uns 11 a 14 fps** sem o `-Perf`. Com o
+  `-Perf` (item 4), algo como **13 a 15 fps**, com menos quadros longos. Indo
+  aos experimentos de resolução (item 4), talvez **16 a 19 fps**. Os 30 fps não
+  estão ao alcance desta placa com a camada como ela está hoje.
+- **Abaixo de 15 fps o tempo do jogo fica mais lento que o real.** O título
+  limita cada passo da simulação a 1/15 s. Por isso, aqui, ficar abaixo de
+  66 ms por quadro importa tanto quanto o fps.
 
 ## 1. Preparar o Windows (uma vez)
 
@@ -61,12 +70,14 @@ dois builds possíveis:
 # diag: o build de todas as medições, com os logs de diagnóstico (comece por este)
 cargo build --locked --profile diag -p victory --features diagnostics
 
-# release: LTO completo, sem os interruptores de depuração (para jogar depois)
+# release: LTO thin com uma unidade de código, sem os interruptores de depuração
 cargo build --locked --release -p victory
 ```
 
 O build release usa bastante RAM ao linkar. Feche tudo antes. Se ele acabar
-por falta de memória, use `cargo build -j 4 ...`.
+por falta de memória, use `cargo build -j 4 ...`. Nenhuma medição deste fork foi
+feita com ele. Só passe a usá-lo depois de uma sessão estável no diag. Ele não
+tem DRED, então o `crashes.log` diz menos.
 
 ## 3. Antes da primeira execução
 
@@ -88,9 +99,21 @@ target\diag\victory.exe warm --used                               # pipelines da
 ## 4. Jogar
 
 ```powershell
-scripts\play.ps1 -Exe "D:\caminho\da\sua\cópia\GTA6.exe" -Vrr *>&1 | Tee-Object -FilePath run.log
+scripts\play.ps1 -Exe "D:\caminho\da\sua\cópia\GTA6.exe" -Perf -Vrr *>&1 | Tee-Object -FilePath run.log
 ```
 
+- `-Perf` é o **modo desempenho**. Ele liga os patches 2, 6 e 7 do renderer
+  (README), que tiram trabalho da thread de envio, a que manda o trabalho do
+  título para a placa:
+  - **2:** acaba com uma varredura de cerca de 600.000 descritores por quadro.
+    Ela custava 15–16 ms de uma thread, e aqui essas threads são só 3.
+  - **6:** as travas de memória deixam de esperar umas pelas outras.
+  - **7:** o diário de escritas é dividido em 64 partes.
+
+  Nenhum dos três depende da marca da placa nem muda os shaders, então as
+  traduções e as pipelines já feitas continuam valendo. O patch 5 fica de fora:
+  ele precisa de um heap de views que a NVIDIA não tem (o launcher avisa se você
+  o ligar). Se algo der errado, tire o `-Perf`. Com `-Safe`, ele é ignorado.
 - `-Vrr` permite *tearing* na troca de quadros, para que o G-SYNC acompanhe a
   taxa de quadros também em janela.
 - `| Tee-Object` guarda o log em `run.log` e mostra o mesmo texto na tela.
@@ -142,8 +165,37 @@ Dentro da camada, sem nenhuma variável:
 | O perfil Series X (saída 4K, muito pesado para 8 GB) | `-Console series-x`, e de preferência `-More @{VICTORY_OUTPUT='1920x1080'}` |
 | Series S com o FidelityFX de console | `-Console series-s` (sem o `VICTORY_UPSCALER=6`) ou `-More @{VICTORY_UPSCALER='7'}` |
 | Nenhuma das escolhas do launcher e do `play.ps1` (a camada continua se adaptando, veja abaixo) | `-More @{VICTORY_HOST_PRESET='0'}` |
-| Passar de 30 fps | `-More @{VICTORY_FRAME_INTERVAL_MS='16.667'}` |
+| Passar de 30 fps (só faz diferença acima de 30) | `-More @{VICTORY_FRAME_INTERVAL_MS='16.667'}` |
 | O modo seguro | `-Safe` |
+
+**Não mude a prioridade do processo no Gerenciador de Tarefas.** A camada já
+roda acima do normal e desliga o *power throttling* do Windows por conta própria.
+
+### Mais fps: experimentos, um de cada vez
+
+Com o `-Perf`, quem limita o quadro aqui passa a ser a placa (estimativa: 65 a
+75 ms por quadro). O que mais ajuda é dar menos trabalho a ela. Nada abaixo foi
+rodado no perfil Series S, então tente um item de cada vez, sempre na mesma
+rua, e volte atrás se a imagem quebrar.
+
+| # | Experimento | O que deve mudar | Risco |
+|---|---|---|---|
+| 1 | `-Output 1664x936` | Imagem de saída menor, render interno de ~1109×624: estimativa de 2,5 a 4 ms a menos de placa e menos VRAM | Imagem e HUD mais suaves |
+| 2 | `-Output 1280x720` | Render interno de 853×480: estimativa de 5 a 8 ms a menos | Imagem bem mais suave |
+| 3 | `-More @{VICTORY_RENDER_SCALE='0.6'}` | Render interno de 1152×648 em vez de 1280×720 (com saída 1080p): estimativa de 1,5 a 2,5 ms a menos | O upscaler do título só foi rodado em 2/3 e em 1,0 |
+| 4 | `-More @{VICTORY_PORT_CONSTANTS='1'}` (patch 1) | Libera cerca de 174 MB de RAM e até ~348 MB de VRAM | A placa passa a ler o heap de constantes pelo PCIe x8: pode ganhar ou perder até ~6 ms. Provavelmente pede um Windows 11 recente (24H2) |
+| 5 | `-More @{VICTORY_CARD_WINDOWS_MB='384'; VICTORY_TEXTURE_ROOM_PERCENT='80'}` | Cópias da memória do título passam a ficar na VRAM, sem cruzar o PCIe a cada desenho | Menos VRAM para texturas, que podem aparecer mais tarde |
+| 6 | `-More @{VICTORY_D3D12_BACKGROUND='0'}` | O driver para de recompilar shaders em segundo plano, o que pesa em 6 núcleos | Nunca medido na NVIDIA |
+
+Para cada um, anote o fps e se a imagem ficou certa. Mantenha o que ajudou e
+some com o próximo (por exemplo: `-Perf -Vrr -Output 1664x936 -More
+@{VICTORY_D3D12_BACKGROUND='0'}`).
+
+**Desenhos faltando ou piscando:** a NVIDIA limita os heaps de views a
+1.000.000. Em cenas cheias, alguns desenhos podem ficar sem vaga e somem, o que
+parece *flicker*, não fps baixo. O log conta isso nas linhas
+`asks for dynamic view slots refused`. Mande essas linhas se vir objetos
+sumindo.
 
 ## 5. Interruptores novos
 
@@ -220,8 +272,11 @@ Mande o `run.log`, o `crashes.log` (em `%LOCALAPPDATA%\victory\data`) e:
    `the PC's memory shared with the card: ...`, e diga com que frequência
    aparecem.
 5. **Tempo de quadro** (a taxa aparece na barra de título) numa rua da cidade,
-   sempre no mesmo lugar. Compare o padrão com cada uma destas variações, uma de
-   cada vez:
+   sempre no mesmo lugar, e a linha do log `the card's clock per frame: nothing
+   of ours queued ... (the card about N% busy ...)`. Ela diz se quem segura o
+   quadro é a placa (perto de 100 %) ou a thread de envio. Compare com e sem
+   `-Perf`, os experimentos do item 4 e cada uma destas variações, uma de cada
+   vez:
    - `-More @{VICTORY_SIMD='avx2'}`
    - `-More @{VICTORY_UPSCALER='7'}`
    - `-More @{VICTORY_HOST_PRESET='0'} -Console series-s` (só as escolhas do

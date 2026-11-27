@@ -6,6 +6,9 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance; Series X)
 # -Vrr          tearing allowed, so that a G-SYNC or FreeSync display follows the frame rate in a window
+# -Perf         renderer patches 2, 6 and 7 (README.md): less work for the submitting thread, on any card;
+#               patch 5 stays off (AMD's in effect), patch 1 is left to -More (it moves reads to the bus)
+# -Output       the title's output size, one of its modes (VICTORY_OUTPUT): smaller is less card time
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}; -More @{VICTORY_HOST_PRESET='0'} leaves out
 #               what the launcher and this script choose for a smaller PC (the launcher says each
@@ -21,6 +24,8 @@ param(
     [switch]$RayTracing,
     [ValidateSet('quality', 'balanced', 'performance')][string]$Fsr4K,
     [switch]$Vrr,
+    [switch]$Perf,
+    [ValidateSet('1280x720', '1664x936', '1920x1080', '2560x1440', '3840x2160')][string]$Output,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{}
 )
@@ -47,6 +52,11 @@ if ($Safe) {
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 if ($Fsr4K) { $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant() }
 if ($Vrr) { $settings.VICTORY_TEARING = '1' }
+# (Patches 2, 6 and 7 save the submitting thread's time and patch no shader, so translations and
+# pipelines made without them still serve. -Safe stays without them.)
+if ($Perf -and $Safe) { Write-Host '-Perf left out with -Safe.' }
+elseif ($Perf) { $settings.VICTORY_PORT_DESCRIPTORS = '1'; $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_JOURNAL = '1' }
+if ($Output) { $settings.VICTORY_OUTPUT = $Output }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"
