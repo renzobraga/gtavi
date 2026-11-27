@@ -62,6 +62,7 @@ if ($discarded) {
 }
 $Exe = (Resolve-Path $Exe).Path
 $arguments = @('run', $Exe, '--execute')
-if ($Console -ne 'auto') { $arguments += '--console', $Console }
+# (PowerShell lets -Console Series-S through; the launcher takes series-s alone.)
+if ($Console -ne 'auto') { $arguments += '--console', $Console.ToLowerInvariant() }
 Push-Location (Join-Path $PSScriptRoot '..')   # victory.toml is looked for here
 try { & $victory @arguments } finally { Pop-Location }
