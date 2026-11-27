@@ -348,7 +348,9 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
     static POOLS: [OnceLock<&'static Pool>; 2] = [const { OnceLock::new() }; 2];
     POOLS[usize::from(records)]
         .get_or_init(|| {
-            let asked = std::env::var("VICTORY_VIEW_THREADS").ok().and_then(|v| v.trim().parse().ok());
+            let switch = |name: &str| -> Option<usize> { std::env::var(name).ok().and_then(|v| v.trim().parse().ok()) };
+            let views = switch("VICTORY_VIEW_THREADS");
+            let asked = if records { switch("VICTORY_RECORDS_THREADS").or(views) } else { views };
             let threads = view_threads(asked, records, crate::cores::small_cpu());
             Pool::new(if records { "victory-records" } else { "victory-views" }, threads)
         })
@@ -356,13 +358,16 @@ pub(crate) fn each_view(records: bool, count: usize, f: &(dyn Fn(usize) + Sync))
 }
 
 /// [`each_view`]'s threads, with the one that asks: `asked`
-/// (`VICTORY_VIEW_THREADS`, 1 to 16, for both kinds), else 4 for views and 6
-/// for records; on a small processor (`crate::cores::small_cpu`) 3 for
-/// records. The heaps' records are looked at by a thread of their own
-/// beside the submitting one, every 4 ms while submissions come
-/// (`crate::descriptor` `sync_early`), whether a submission waits or not:
-/// six threads at it are as many as a Ryzen 5 7600X has cores, at the
-/// moments the submitting thread and the title's want them too.
+/// (`VICTORY_VIEW_THREADS`, 1 to 16, for both kinds; for records
+/// `VICTORY_RECORDS_THREADS` before it, the heaps' records alone, not the
+/// frame recorder's `VICTORY_RECORD`), else 4 for views and 6 for records;
+/// on a small processor (`crate::cores::small_cpu`) 3 for records
+/// (`VICTORY_RECORDS_THREADS=6` there: as before, the views left at 4). The
+/// heaps' records are looked at by a thread of their own beside the
+/// submitting one, every 4 ms while submissions come (`crate::descriptor`
+/// `sync_early`), whether a submission waits or not: six threads at it are
+/// as many as a Ryzen 5 7600X has cores, at the moments the submitting
+/// thread and the title's want them too.
 fn view_threads(asked: Option<usize>, records: bool, small: bool) -> usize {
     match asked {
         Some(n) => n.clamp(1, 16),

@@ -518,9 +518,19 @@ fn slow_limit() -> usize {
             usize::MAX
         } else {
             let (processors, cores) = processors();
-            (worker_count(None, processors, cores) / 4).max(1)
+            slow_count(started(), processors, cores)
         }
     })
+}
+
+/// [`slow_limit`] with `workers` started: a quarter of [`worker_count`]'s
+/// own choice, at least 1, whatever `VICTORY_PIPELINE_WORKERS` says (as
+/// before); on a small processor (`crate::cores::small_cpu`) a quarter of
+/// those started, so that `VICTORY_PIPELINE_WORKERS=8` on a Ryzen 5 7600X
+/// is the 8 and the 2 slow ones it had before.
+fn slow_count(workers: usize, processors: usize, cores: usize) -> usize {
+    let of = if crate::cores::small_cpu_of(processors) { workers } else { worker_count(None, processors, cores) };
+    (of / 4).max(1)
 }
 
 struct Queue {
@@ -636,20 +646,42 @@ fn next(screens_only: bool) -> Arc<Pending> {
 /// title's own threads, and a cold cache queues hundreds at once.
 ///
 /// On a small processor (`crate::cores::small_cpu`: under 16 logical ones)
-/// two less than its `cores`, at least 2: 4 on a Ryzen 5 7600X, where two
-/// thirds were 8, and with the two for passes over the screen
-/// ([`SCREEN_WORKERS`]) as many as it has cores. Below the title's threads
-/// they take no processor the others want, but a compile on a core's second
-/// thread slows whatever runs on its first, and with a cold cache all of
-/// them compile for minutes: on six cores, ten would be on every core. The slow
-/// ones get a quarter of these ([`slow_limit`]: 1 there). Not measured there
-/// yet; `VICTORY_PIPELINE_WORKERS=8` is as before.
+/// two less than its `cores`, at least 2 and never more than two thirds:
+/// 4 on a Ryzen 5 7600X, where two thirds were 8, and with the two for
+/// passes over the screen ([`SCREEN_WORKERS`]) as many as it has cores.
+/// Below the title's threads they take no processor the others want, but a
+/// compile on a core's second thread slows whatever runs on its first, and
+/// with a cold cache all of them compile for minutes: on six cores, ten
+/// would be on every core. (One with a thread a core gets no more than the
+/// two thirds it had: eight cores, 5.) The slow ones get a quarter of these
+/// ([`slow_limit`]: 1 there). Not measured there yet; with
+/// `VICTORY_PIPELINE_WORKERS=8` it is as before, slow ones and all. A cold
+/// cache (a new driver, or a card whose cache this one never made) takes
+/// longer to fill with fewer: the first minutes after one are where 4 and
+/// 8 differ.
 fn worker_count(asked: Option<usize>, processors: usize, cores: usize) -> usize {
+    let thirds = (processors * 2 / 3).clamp(2, 16);
     match asked {
         Some(n) => n.clamp(1, 64),
-        None if crate::cores::small_cpu_of(processors) => cores.saturating_sub(2).max(2),
-        None => (processors * 2 / 3).clamp(2, 16),
+        None if crate::cores::small_cpu_of(processors) => cores.saturating_sub(2).max(2).min(thirds),
+        None => thirds,
     }
+}
+
+/// [`worker_count`] of the switch and this processor, once: the workers
+/// [`workers`] starts.
+fn started() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let (processors, cores) = processors();
+        worker_count(
+            std::env::var("VICTORY_PIPELINE_WORKERS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok()),
+            processors,
+            cores,
+        )
+    })
 }
 
 /// The logical processors and the cores, for [`worker_count`].
@@ -662,14 +694,7 @@ fn workers() -> bool {
     static RUNNING: OnceLock<bool> = OnceLock::new();
     *RUNNING.get_or_init(|| {
         let mut running = false;
-        let (processors, cores) = processors();
-        let workers = worker_count(
-            std::env::var("VICTORY_PIPELINE_WORKERS")
-                .ok()
-                .and_then(|v| v.trim().parse().ok()),
-            processors,
-            cores,
-        );
+        let workers = started();
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         guard_start();
@@ -765,6 +790,23 @@ mod tests {
         assert_eq!(worker_count(None, 8, 4), 2);
         assert_eq!(worker_count(None, 4, 4), 2);
         assert_eq!(worker_count(Some(8), 12, 6), 8);
+        // One thread to a core: never more than two thirds, as before.
+        assert_eq!(worker_count(None, 8, 8), 5);
+        assert_eq!(worker_count(None, 12, 12), 8);
+    }
+
+    #[test]
+    fn slow_ones_are_a_quarter_of_the_workers() {
+        // The i9-12900K: a quarter of its own choice (16), whatever the
+        // switch started, as before.
+        assert_eq!(slow_count(16, 24, 16), 4);
+        assert_eq!(slow_count(4, 24, 16), 4);
+        assert_eq!(slow_count(40, 24, 16), 4);
+        // A Ryzen 5 7600X: a quarter of those started; 8 asked for is the
+        // 2 it had before.
+        assert_eq!(slow_count(4, 12, 6), 1);
+        assert_eq!(slow_count(8, 12, 6), 2);
+        assert_eq!(slow_count(1, 12, 6), 1);
     }
 
     /// A first use queues the pipeline and, within the budget, gets the
