@@ -161,7 +161,16 @@ pub(crate) fn translation() -> [u8; 32] {
 pub fn precompile(container: &[u8]) -> Result<bool, String> {
     let _ = crate::host::host();
     let misses = MISSES.load(Ordering::Relaxed);
-    let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+    let translate = |c: &[u8]| {
+        let shader = victory_shader::emit::translate(c).map_err(|e| e.to_string())?;
+        // Translated now: a compute program a card of 32-lane waves refuses, or
+        // may, is named, as a run would (the group-shared memory is known on
+        // this thread until its next translation alone).
+        if let Some(why) = victory_shader::emit::narrow_refusal(&shader) {
+            crate::pipeline::tell_narrow_refusal("compute", &blake3::hash(c).to_hex()[..16], why);
+        }
+        Ok(shader)
+    };
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, true)?,
         None => translate(container)?,

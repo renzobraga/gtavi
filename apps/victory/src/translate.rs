@@ -409,14 +409,17 @@ pub fn run(
 }
 
 /// The compute programs translated now that a card of 32-lane waves (NVIDIA)
-/// refuses (`victory_shader::emit::narrow_refusal`), when there are any.
+/// refuses (`victory_shader::emit::narrow_refusal`), when there are any. Each
+/// was named as it was translated, by `victory translate`
+/// ([`translate_programs`]) or in the log of `victory shaders`
+/// (`victory_gpu::shader_cache::precompile`).
 fn narrow_refusals() {
     let [wave64, shared] = victory_shader::emit::narrow_refusals();
     if wave64 + shared > 0 {
         println!(
             "             for 32-lane waves {wave64} compute programs still need waves of 64 (their pipelines \
-             are refused) and {shared} more than 32 KiB of group-shared memory (theirs may be); a run's \
-             log names them"
+             are refused) and {shared} more than 32 KiB of group-shared memory (theirs may be); each is \
+             named above by the hash a run's log names it by"
         );
     }
 }
@@ -656,6 +659,16 @@ fn translate_programs(container: &Container, programs: Vec<NativeProgram>, examp
                     *counter(t, p.stage, 0) += 1;
                     match emit::emit_with_retries(container, &p, &program, &s, &i, &r) {
                         Ok(shader) => {
+                            // (on this thread, right after it was translated: [`narrow_refusals`])
+                            match emit::narrow_refusal(&shader) {
+                                Some(emit::NarrowRefusal::Wave64) => {
+                                    println!("for 32-lane waves: needs waves of 64, refused: {}", label());
+                                }
+                                Some(emit::NarrowRefusal::GroupShared(bytes)) => {
+                                    println!("for 32-lane waves: {bytes} bytes of group-shared memory, may be refused: {}", label());
+                                }
+                                None => {}
+                            }
                             census_line(&label(), &p, &program, &shader);
                             *counter(t, p.stage, 1) += 1;
                             check(shader, t, checks, label);

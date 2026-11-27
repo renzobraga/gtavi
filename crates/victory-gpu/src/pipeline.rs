@@ -192,28 +192,40 @@ impl Shader {
                 if let Ok(t) = &done
                     && let Some(why) = victory_shader::emit::narrow_refusal(&t.host)
                 {
-                    use victory_shader::emit::NarrowRefusal;
-                    match why {
-                        NarrowRefusal::Wave64 => tracing::warn!(
-                            stage = self.stage,
-                            hash = %self.hash,
-                            "refused by a card of 32-lane waves: a console wave64 compute program that \
-                             still needs waves of 64 (VICTORY_WAVE_WHY=1 with `victory translate` says \
-                             why); its dispatches are dropped"
-                        ),
-                        NarrowRefusal::GroupShared(bytes) => tracing::warn!(
-                            stage = self.stage,
-                            hash = %self.hash,
-                            bytes,
-                            "on a card of 32-lane waves: run as two waves of 32 the program needs more \
-                             group-shared memory than the 32 KiB D3D12 names; if its pipeline is refused \
-                             (\"host pipeline refused\"), its dispatches are dropped"
-                        ),
-                    }
+                    tell_narrow_refusal(self.stage, &self.hash, why);
                 }
                 done.ok()
             })
             .as_ref()
+    }
+}
+
+/// Names a compute program whose pipeline a card of 32-lane waves (NVIDIA)
+/// refuses, or may refuse, and why (`victory_shader::emit::narrow_refusal`),
+/// by `hash`, the 16 hex digits of its container's BLAKE3 a run's log names
+/// it by: where a run first uses it ([`Shader::translated`]), and where
+/// `victory shaders` translates it ([`crate::shader_cache::precompile`]). Of
+/// a translation the cache serves, a run knows the wave size but not the
+/// group-shared memory: those programs are named where translated afresh.
+#[cfg(windows)]
+pub(crate) fn tell_narrow_refusal(stage: &str, hash: &str, why: victory_shader::emit::NarrowRefusal) {
+    use victory_shader::emit::NarrowRefusal;
+    match why {
+        NarrowRefusal::Wave64 => tracing::warn!(
+            stage,
+            hash,
+            "refused by a card of 32-lane waves: a console wave64 compute program that still needs \
+             waves of 64 (`VICTORY_HOST_WAVE=32 VICTORY_WAVE_WHY=1 VICTORY_TRANSLATE_ONLY=<hash> \
+             victory translate` says why); its dispatches are dropped"
+        ),
+        NarrowRefusal::GroupShared(bytes) => tracing::warn!(
+            stage,
+            hash,
+            bytes,
+            "on a card of 32-lane waves: run as two waves of 32 the program needs more group-shared \
+             memory than the 32 KiB D3D12 names; if its pipeline is refused (\"host pipeline \
+             refused\"), its dispatches are dropped"
+        ),
     }
 }
 
