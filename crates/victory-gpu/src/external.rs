@@ -14,6 +14,22 @@ pub fn host_device() -> Option<ID3D12Device> {
     crate::host::host().map(|h| h.device.clone())
 }
 
+/// The PCI vendor id and the name of the adapter the host device is on, as
+/// DXGI gives them; `None` without a host GPU or when DXGI does not name it.
+pub fn host_adapter() -> Option<(u32, String)> {
+    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    let device = &crate::host::host()?.device;
+    // SAFETY: plain queries.
+    let desc = unsafe {
+        CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+            .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
+            .and_then(|a| a.GetDesc1())
+    }
+    .ok()?;
+    let name = String::from_utf16_lossy(&desc.Description);
+    Some((desc.VendorId, name.trim_end_matches('\0').to_owned()))
+}
+
 /// The active host list for one synchronous external recording call.
 pub struct Recording<'a>(&'a crate::host::HostList);
 

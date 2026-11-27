@@ -157,6 +157,8 @@ struct Host {
     dispatch: Call,
     device: ID3D12Device,
     provider_id: u64,
+    /// The name the SDK gave that provider ([`select_version`]).
+    provider: String,
 }
 
 struct Library(windows_sys::Win32::Foundation::HMODULE);
@@ -274,9 +276,22 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
             .ok_or_else(|| format!("{DLL} has no {}", name.to_string_lossy()))
     };
     let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
+    let any = any_provider();
+    if !any
+        && let Some((vendor, name)) = victory_gpu::external::host_adapter()
+        && let Some(why) = not_for_adapter(vendor, &name)
+    {
+        return Err(why);
+    }
     // SAFETY: the SDK's ffxQuery export, with its declared signature.
     let query = unsafe { std::mem::transmute::<*const c_void, Call>(find(c"ffxQuery")?) };
-    let (provider_id, version) = select_version(query, &device)?;
+    let (provider_id, version) = select_version(query, &device, any)?;
+    if !is_fsr_4_1_2(&version) {
+        tracing::warn!(
+            provider = version,
+            "FidelityFX: no FSR 4.1.2 for this card; VICTORY_FSR_ANY_PROVIDER=1 takes the newest upscaler it offers (untried)"
+        );
+    }
     // SAFETY: the API's exports, with its signatures.
     let host = unsafe {
         Host {
@@ -288,6 +303,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
             _library: library,
             device,
             provider_id,
+            provider: version.clone(),
         }
     };
     Ok((host, version))
@@ -298,8 +314,73 @@ fn is_fsr_4_1_2(name: &str) -> bool {
         .is_some_and(|suffix| !suffix.starts_with(|c: char| c.is_ascii_digit()))
 }
 
-/// The SDK supplies the version id to put in the context creation chain.
-fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String), String> {
+/// What to do instead of the PC FSR 4, for the message that refuses it.
+const INSTEAD: &str = "Leave -Fsr4K (VICTORY_FSR_4K) off: the title's own upscaler runs instead, and \
+     VICTORY_RENDER_SCALE sets the size it renders at. VICTORY_FSR_ANY_PROVIDER=1 tries the newest \
+     upscaler the DLL offers for this card instead (FSR 3.1 on cards other than RDNA 4 Radeons; untried).";
+
+/// `VICTORY_FSR_ANY_PROVIDER=1`: the PC upscaler (`-Fsr4K`) is the newest one
+/// the DLL offers for the host card when it offers no FSR 4.1.2, and it is
+/// tried on any card. AMD's signed DLL holds FSR 4, which runs on RDNA 4
+/// Radeons alone, and FSR 3.1, which runs on other cards too, behind the same
+/// interface. Off by default: FSR 4.1.2 or nothing, and a card that is not
+/// AMD's is refused before the DLL is asked ([`not_for_adapter`]). An
+/// experiment, untried in a run: the 4K output of the profile is heavy for a
+/// card of 8 GB.
+pub fn any_provider() -> bool {
+    std::env::var_os("VICTORY_FSR_ANY_PROVIDER").is_some_and(|v| v == "1")
+}
+
+/// Why the PC FSR 4 cannot run on the host card of PCI vendor `vendor`, named
+/// `name`: it is not AMD's. (Which AMD cards have it, the DLL says.)
+fn not_for_adapter(vendor: u32, name: &str) -> Option<String> {
+    const AMD: u32 = 0x1002;
+    (vendor != AMD).then(|| {
+        format!(
+            "FSR 4 runs on AMD Radeon RX 9000 series (RDNA 4) cards only, and the host card is {name} \
+             (PCI vendor {vendor:#06x}). {INSTEAD}"
+        )
+    })
+}
+
+/// Of the upscalers the DLL offers (`(id, name)` as the SDK lists them), the
+/// one to use: FSR 4.1.2, or with `any` and without it the newest by its
+/// version number (the first of equals).
+fn pick_provider(offered: &[(u64, String)], any: bool) -> Option<usize> {
+    if let Some(at) = offered.iter().position(|(_, name)| is_fsr_4_1_2(name)) {
+        return Some(at);
+    }
+    if !any {
+        return None;
+    }
+    let mut best: Option<(usize, Vec<u32>)> = None;
+    for (at, (_, name)) in offered.iter().enumerate() {
+        let n = version_number(name);
+        if best.as_ref().is_none_or(|(_, b)| n > *b) {
+            best = Some((at, n));
+        }
+    }
+    best.map(|(at, _)| at)
+}
+
+/// The numbers a provider's name starts with: "3.1.5" is [3, 1, 5], "4.1.2b"
+/// [4, 1, 2], a name without one none.
+fn version_number(name: &str) -> Vec<u32> {
+    let mut numbers = Vec::new();
+    for part in name.split('.') {
+        let digits = part.len() - part.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        let Ok(n) = part[..digits].parse() else { break };
+        numbers.push(n);
+        if digits < part.len() {
+            break;
+        }
+    }
+    numbers
+}
+
+/// The SDK supplies the version id to put in the context creation chain:
+/// FSR 4.1.2's, or with `any` the one [`pick_provider`] takes.
+fn select_version(query_fn: Call, device: &ID3D12Device, any: bool) -> Result<(u64, String), String> {
     let mut count = 0u64;
     let mut query = GetVersions {
         header: Header {
@@ -337,15 +418,17 @@ fn select_version(query_fn: Call, device: &ID3D12Device) -> Result<(u64, String)
             let name = unsafe { CStr::from_ptr(name) }
                 .to_string_lossy()
                 .into_owned();
-            if is_fsr_4_1_2(&name) {
-                return Ok((id, name));
-            }
-            available.push(name);
+            available.push((id, name));
         }
     }
+    if let Some(at) = pick_provider(&available, any) {
+        return Ok(available.swap_remove(at));
+    }
+    let names: Vec<&str> = available.iter().map(|(_, name)| name.as_str()).collect();
     Err(format!(
-        "no FSR 4.1.2 provider for this adapter (available: {})",
-        available.join(", ")
+        "no FSR 4.1.2 provider for this adapter (available: {}). FSR 4 runs on AMD Radeon RX 9000 \
+         series (RDNA 4) cards only. {INSTEAD}",
+        names.join(", ")
     ))
 }
 
@@ -440,9 +523,11 @@ extern "C" fn ffxCreateContext(
     // SAFETY: a NUL-terminated name the DLL keeps, if any.
     let name = (!version.name.is_null())
         .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
+    // (FSR 4.1.2, or with VICTORY_FSR_ANY_PROVIDER=1 the one asked for)
+    let asked = |name: &str| is_fsr_4_1_2(name) || (any_provider() && name == host.provider);
     if query_code != OK
         || version.id != host.provider_id
-        || !name.as_deref().is_some_and(is_fsr_4_1_2)
+        || !name.as_deref().is_some_and(asked)
     {
         tracing::warn!(
             query_code,
@@ -833,5 +918,47 @@ mod tests {
         assert_eq!(host_state(0x2), Some(0x8));
         assert_eq!(host_state(0x200), Some(0x10));
         assert_eq!(host_state(0x14), None);
+    }
+
+    /// A card that is not AMD's is refused with what to do instead; an AMD
+    /// card is left for the DLL to answer.
+    #[test]
+    fn fsr_4_is_refused_on_a_card_that_is_not_amds() {
+        assert_eq!(not_for_adapter(0x1002, "AMD Radeon RX 7900 XTX"), None);
+        let why = not_for_adapter(0x10de, "NVIDIA GeForce RTX 5060 Ti").unwrap();
+        assert!(why.contains("NVIDIA GeForce RTX 5060 Ti") && why.contains("0x10de"), "{why}");
+        assert!(why.contains("VICTORY_RENDER_SCALE") && why.contains("VICTORY_FSR_ANY_PROVIDER=1"), "{why}");
+        assert!(not_for_adapter(0x8086, "Intel(R) Arc(TM)").is_some());
+    }
+
+    #[test]
+    fn version_numbers_are_read_from_the_start_of_a_name() {
+        assert_eq!(version_number("3.1.5"), [3, 1, 5]);
+        assert_eq!(version_number("4.1.2"), [4, 1, 2]);
+        assert_eq!(version_number("4.1.2b"), [4, 1, 2]);
+        assert_eq!(version_number("3.1.4 (FSR3)"), [3, 1, 4]);
+        assert_eq!(version_number("10.0"), [10, 0]);
+        assert!(version_number("FSR").is_empty());
+        assert!(version_number("").is_empty());
+    }
+
+    fn offered(names: &[&str]) -> Vec<(u64, String)> {
+        names.iter().enumerate().map(|(id, name)| (id as u64 + 100, (*name).to_owned())).collect()
+    }
+
+    /// FSR 4.1.2 is taken wherever it is in the list; without it nothing,
+    /// unless any upscaler is asked for: then the newest.
+    #[test]
+    fn fsr_4_1_2_is_picked_and_with_any_the_newest_else() {
+        let rdna4 = offered(&["3.1.5", "4.0.2", "4.1.2"]);
+        assert_eq!(pick_provider(&rdna4, false), Some(2));
+        assert_eq!(pick_provider(&rdna4, true), Some(2));
+        let other = offered(&["3.1.4", "3.1.5"]);
+        assert_eq!(pick_provider(&other, false), None);
+        assert_eq!(pick_provider(&other, true), Some(1));
+        assert_eq!(pick_provider(&offered(&["3.1.5", "3.1.5"]), true), Some(0));
+        assert_eq!(pick_provider(&offered(&["4.1.20", "3.1.5"]), false), None);
+        assert_eq!(pick_provider(&offered(&["4.1.20", "3.1.5"]), true), Some(0));
+        assert_eq!(pick_provider(&[], true), None);
     }
 }
