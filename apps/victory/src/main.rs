@@ -4,6 +4,8 @@
 //! the user's cache directory (outside the repository).
 
 mod census;
+#[cfg(any(windows, test))]
+mod host_preset;
 mod inspect;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod replay;
@@ -151,8 +153,11 @@ enum Command {
         /// Actually start the title. Without it, stop after binding.
         #[arg(long)]
         execute: bool,
-        /// The console model the title sees (device type, memory).
-        #[arg(long, value_enum, default_value_t = Console::SeriesX)]
+        /// The console model the title sees (device type, memory). `auto`:
+        /// Series S on a PC with 24 GiB of RAM or less or a card with 10 GiB
+        /// of its own or less, Series X otherwise and with FSR 4K
+        /// (`VICTORY_HOST_PRESET=0`: Series X).
+        #[arg(long, value_enum, default_value_t = Console::Auto)]
         console: Console,
         /// Arguments for the title, after `--` (it reads the whole command
         /// line; a title that relaunches itself passes some).
@@ -175,6 +180,8 @@ enum Unimplemented {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Console {
+    /// Chosen for this PC (`host_preset.rs`).
+    Auto,
     SeriesX,
     SeriesS,
 }

@@ -62,12 +62,17 @@ fn err(e: windows::core::Error) -> String {
     e.message().to_string()
 }
 
-fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
+/// Whether an adapter is the software one (WARP, or the basic render
+/// driver); [`create_preferred_device`] passes them over, and so does the
+/// launcher's look at the adapter it will get.
+pub fn software(desc: &DXGI_ADAPTER_DESC1) -> bool {
     desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0
         || (desc.VendorId == 0x1414 && desc.DeviceId == 0x8c)
 }
 
-fn adapter_matches(requested: &str, index: u32, name: &str) -> bool {
+/// Whether `VICTORY_D3D12_ADAPTER` (`requested`) names the adapter of DXGI
+/// index `index` called `name`: the index, or a part of the name.
+pub fn adapter_matches(requested: &str, index: u32, name: &str) -> bool {
     if let Ok(wanted) = requested.parse::<u32>() {
         wanted == index
     } else {
