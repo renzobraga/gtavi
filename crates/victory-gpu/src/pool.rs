@@ -92,13 +92,23 @@ fn spares(memory: Option<[u64; 4]>, keep: bool) -> usize {
 /// The most empty blocks of textures kept while the card has room
 /// ([`spares`]): [`SPARE_KEPT`] (4 GiB), on a small card
 /// (`crate::host::small_card`) a sixteenth of the budget (some 6 blocks on a
-/// card of 8 GB, at least [`SPARE`]). The card's use counts them, so they
-/// went only at 85 % of its budget; on a small card the copies of title
-/// buffers and windows (made up to 80 %) found the room taken. Blocks made
-/// ahead ([`ahead`]) are as many at most.
+/// card of 8 GB, at least [`SPARE`]), but not fewer than the blocks made
+/// ahead ([`ahead`], 12): those are kept by the same count ([`Ripe::now`]),
+/// and fewer of them would cut more textures from blocks made while lists
+/// ran (the device lost in runs n08 and n11). The card's use counts the
+/// empty blocks, so they went only at 85 % of its budget; on a small card
+/// the copies of title buffers and windows (made up to 80 %) found the room
+/// taken: 12 blocks are 768 MiB, 64 were 4 GiB.
 pub(crate) fn texture_spares_most(budget: Option<u64>) -> usize {
+    texture_spares_for(budget, ahead())
+}
+
+/// [`texture_spares_most`] with `ahead` blocks made ahead.
+fn texture_spares_for(budget: Option<u64>, ahead: usize) -> usize {
     match budget {
-        Some(budget) if crate::host::small_card(budget) => ((budget / 16 / BLOCK) as usize).clamp(SPARE, SPARE_KEPT),
+        Some(budget) if crate::host::small_card(budget) => {
+            ((budget / 16 / BLOCK) as usize).max(ahead).clamp(SPARE, SPARE_KEPT)
+        }
         _ => SPARE_KEPT,
     }
 }
@@ -853,16 +863,22 @@ mod tests {
     #[test]
     fn a_small_card_keeps_a_sixteenth_of_its_budget_in_empty_blocks() {
         const MIB: u64 = 1 << 20;
-        // A card of 8 GB, by the budget the layer works by.
-        assert_eq!(texture_spares_most(Some(7_000 * MIB)), 6);
-        assert_eq!(texture_spares_most(Some(12 << 30)), 12);
-        assert_eq!(texture_spares_most(Some(2 << 30)), SPARE);
-        assert_eq!(texture_spares_most(Some(1 << 30)), SPARE);
+        // A card of 8 GB, by the budget the layer works by: a sixteenth is
+        // 6 blocks, the 12 made ahead stay.
+        assert_eq!(texture_spares_for(Some(7_000 * MIB), 12), 12);
+        assert_eq!(texture_spares_for(Some(7_000 * MIB), 0), 6);
+        assert_eq!(texture_spares_for(Some(7_000 * MIB), 4), 6);
+        assert_eq!(texture_spares_for(Some(12 << 30), 0), 12);
+        assert_eq!(texture_spares_for(Some(2 << 30), 0), SPARE);
+        assert_eq!(texture_spares_for(Some(1 << 30), 0), SPARE);
+        // Never more than a larger card keeps.
+        assert_eq!(texture_spares_for(Some(7_000 * MIB), 100), SPARE_KEPT);
         // Larger cards, and none that says: as before.
-        assert_eq!(texture_spares_most(Some((12 << 30) + 1)), SPARE_KEPT);
-        assert_eq!(texture_spares_most(Some(24_000 * MIB)), SPARE_KEPT);
-        assert_eq!(texture_spares_most(None), SPARE_KEPT);
-        assert_eq!(spares(Some([7_000 * MIB, 5_000 * MIB, 0, 0]), true), 6);
+        assert_eq!(texture_spares_for(Some((12 << 30) + 1), 12), SPARE_KEPT);
+        assert_eq!(texture_spares_for(Some(24_000 * MIB), 12), SPARE_KEPT);
+        assert_eq!(texture_spares_for(None, 12), SPARE_KEPT);
+        let ahead = ahead();
+        assert_eq!(spares(Some([7_000 * MIB, 5_000 * MIB, 0, 0]), true), ahead.max(6).clamp(SPARE, SPARE_KEPT));
         assert_eq!(spares(Some([7_000 * MIB, 6_000 * MIB, 0, 0]), true), SPARE);
     }
 

@@ -1774,9 +1774,45 @@ fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
 /// some 7.3 GB). Rules that keep room on the card for one thing or another
 /// were set on cards of 24 GB (and 12 GB before), and keep less on one of
 /// these. (Here, not in `crate::host`, for the tests on any system.)
+///
+/// Decided once for the run, at the first budget the system gives
+/// ([`decide_small_card`]), and only the arithmetic of each rule follows
+/// the budget after that: the budget moves (by some 1 GB at a world's first
+/// frame), and the rules would come and go with it, on a card of 24 GB too
+/// while another program held much of it. Before that, and in the tests,
+/// by `budget` itself.
 #[cfg(any(windows, test))]
 pub(crate) fn small_card(budget: u64) -> bool {
+    #[cfg(not(test))]
+    match SMALL_CARD.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    small_budget(budget)
+}
+
+/// [`small_card`] by `budget` alone.
+#[cfg(any(windows, test))]
+fn small_budget(budget: u64) -> bool {
     budget > 0 && budget <= 12 << 30
+}
+
+/// [`small_card`]'s verdict for the run: 0 none yet, 1 not a small card,
+/// 2 a small card.
+#[cfg(windows)]
+static SMALL_CARD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Decides [`small_card`] for the run by the first budget of the card's own
+/// memory the system gives that is not 0 (`Host::video_memory`, with
+/// `VICTORY_VRAM_MB`'s cap applied: a card of any size under a cap of
+/// 12 GiB or less is taken for a small one); later calls change nothing.
+#[cfg(windows)]
+pub(crate) fn decide_small_card(budget: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if budget > 0 {
+        let _ = SMALL_CARD.compare_exchange(0, if small_budget(budget) { 2 } else { 1 }, Relaxed, Relaxed);
+    }
 }
 
 /// For the memory plan said at the start: [`texture_floor_bytes`].
@@ -1787,22 +1823,26 @@ pub(crate) fn texture_floor(vram_budget: Option<u64>) -> u64 {
 
 /// Whether textures under the floor ([`texture_floor_bytes`]) are made:
 /// always, but on a small card only while the card's memory in use, without
-/// what our own blocks have free (`spare`, asked only then), is under its
-/// budget (past it the system moves memory to the PC's).
+/// what our own blocks have free (`spare`, asked only then), is under the
+/// budget the system gives (`system`, `crate::host::system_budget`; past it
+/// the system moves memory to the PC's), not the smaller one the layer
+/// works by: those are the textures the title cannot draw without. (0: the
+/// system's is not known, the layer's then.)
 #[cfg(any(windows, test))]
-fn under_floor(filled: u64, memory: Option<[u64; 4]>, spare: impl FnOnce() -> u64) -> bool {
+fn under_floor(filled: u64, memory: Option<[u64; 4]>, system: u64, spare: impl FnOnce() -> u64) -> bool {
     if filled >= texture_floor_bytes(memory.map(|[budget, ..]| budget)) {
         return false;
     }
     match memory {
-        Some([budget, used, ..]) if small_card(budget) => used.saturating_sub(spare()) < budget,
+        Some([budget, used, ..]) if small_card(budget) => used.saturating_sub(spare()) < system.max(budget),
         _ => true,
     }
 }
 
 /// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
+/// shaders that pick textures by index (`draw.rs` `heap_textures`): up to
+/// [`texture_floor_bytes`] bytes of them always (on a small card while the
+/// card is under the system's budget, [`under_floor`]), beyond that while the card's
 /// memory in use by this process is under nine tenths of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
 /// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
@@ -1822,7 +1862,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    if under_floor(filled, memory, crate::pool::texture_room) {
+    if under_floor(filled, memory, crate::host::system_budget(), crate::pool::texture_room) {
         return true;
     }
     match memory {
@@ -4716,22 +4756,30 @@ float4 lit() : SV_Target { return 1.0; }
 
     #[test]
     fn under_the_floor_a_small_card_still_asks_its_budget() {
+        const MIB: u64 = 1 << 20;
         const GIB: u64 = 1 << 30;
         let spare = || GIB / 2;
         let not_asked = || -> u64 { panic!("a large card's blocks are not asked") };
         // A card of 24 GB: under the floor, always, and its blocks not asked.
         let big = Some([23 * GIB, 30 * GIB, 0, 0]);
-        assert!(under_floor(GIB, big, not_asked));
-        assert!(!under_floor(2 * GIB, big, not_asked));
-        // A card of 8 GB: under the floor only under its budget, without
-        // what the blocks have free.
-        let small = |used| Some([7 * GIB, used, 0, 0]);
-        assert!(under_floor(GIB / 2, small(6 * GIB), spare));
-        assert!(under_floor(GIB / 2, small(7 * GIB), spare));
-        assert!(!under_floor(GIB / 2, small(7 * GIB + GIB / 2), spare));
-        assert!(!under_floor(GIB, small(GIB), spare), "past the floor");
+        assert!(under_floor(GIB, big, 23 * GIB, not_asked));
+        assert!(!under_floor(2 * GIB, big, 23 * GIB, not_asked));
+        // A card of 8 GB: under the floor only under the system's budget,
+        // without what the blocks have free.
+        let (system, layer) = (7_300 * MIB, 6_916 * MIB);
+        let small = |used| Some([layer, used, 0, 0]);
+        assert!(under_floor(GIB / 2, small(6 * GIB), system, spare));
+        assert!(under_floor(GIB / 2, small(7 * GIB), system, spare));
+        // Past the layer's budget, under the system's: still made.
+        assert!(under_floor(GIB / 2, small(7_100 * MIB), 7_300 * MIB, || 0));
+        assert!(!under_floor(GIB / 2, small(7_300 * MIB), 7_300 * MIB, || 0));
+        assert!(!under_floor(GIB / 2, small(7_300 * MIB + GIB / 2), system, spare));
+        assert!(!under_floor(GIB, small(GIB), system, spare), "past the floor");
+        // The system's budget not known: the layer's.
+        assert!(!under_floor(GIB / 2, small(7_000 * MIB), 0, || 0));
+        assert!(under_floor(GIB / 2, small(6_900 * MIB), 0, || 0));
         // No budget said: as before.
-        assert!(under_floor(GIB, None, not_asked));
+        assert!(under_floor(GIB, None, 0, not_asked));
     }
 
     #[test]

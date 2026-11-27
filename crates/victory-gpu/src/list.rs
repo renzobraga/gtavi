@@ -323,7 +323,8 @@ pub(crate) fn renewal_said(followed: bool) -> &'static str {
 }
 
 /// Lets go of the idle host lists past [`idle_most`], the ones that waited
-/// longest first (the sweep, once a second).
+/// longest first (the sweep, as the PC's memory the card shares enters its
+/// High band; [`recycle`] keeps to it after that).
 #[cfg(windows)]
 pub(crate) fn trim_idle() {
     let most = idle_most();

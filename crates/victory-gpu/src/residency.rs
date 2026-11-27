@@ -157,6 +157,10 @@ pub(crate) fn total_ram() -> Option<u64> {
 /// not. The layer holds some 30 GB of private memory on a PC of 64 GB, and
 /// what it keeps spare is sized for that one. `VICTORY_SMALL_RAM=1` takes
 /// any PC for one, `=0` none, to measure what it changes on either kind.
+/// (With a small card the memory the card shares is followed all the same,
+/// [`shared_followed`], and from its Watch band on [`short_of_ram`] holds
+/// again: a run with none of it is `VICTORY_SMALL_RAM=0` with
+/// `VICTORY_SHARED_BAND=0`.)
 pub(crate) fn small_ram_host() -> bool {
     static SMALL: OnceLock<bool> = OnceLock::new();
     *SMALL.get_or_init(|| match std::env::var("VICTORY_SMALL_RAM").as_deref().map(str::trim) {
@@ -235,18 +239,17 @@ pub(crate) fn shared_followed(budget: Option<u64>) -> bool {
     set.unwrap_or_else(|| small_ram_host() || budget.is_some_and(crate::host::small_card))
 }
 
-/// Called by the once-per-second sweep with `Host::video_memory`'s numbers.
-/// In High the sweep lets go of what is kept spare (`crate::host` says
-/// what); from Watch on less is kept as it comes back ([`short_of_ram`]).
-/// Each change is said with both numbers.
-pub(crate) fn refresh_shared(memory: Option<[u64; 4]>) {
-    let Some([budget, _, shared_budget, shared_used]) = memory else {
-        return;
-    };
+/// Called by the once-per-second sweep with `Host::video_memory`'s numbers:
+/// the band it changed to, if it changed. On entering High the sweep lets
+/// go once of what is kept spare (`crate::host` says what); from Watch on
+/// less is kept as it comes back ([`short_of_ram`]). Each change is said
+/// with both numbers.
+pub(crate) fn refresh_shared(memory: Option<[u64; 4]>) -> Option<Shared> {
+    let [budget, _, shared_budget, shared_used] = memory?;
     let was = shared_band();
     let band = if shared_followed(Some(budget)) { next_shared(was, shared_used, shared_budget) } else { Shared::Calm };
     if band == was {
-        return;
+        return None;
     }
     SHARED.store(band as u8, Ordering::Relaxed);
     tracing::info!(
@@ -259,6 +262,7 @@ pub(crate) fn refresh_shared(memory: Option<[u64; 4]>) {
         was,
         band
     );
+    Some(band)
 }
 
 /// Whether what comes back for reuse is kept sparingly: on a small RAM host
@@ -267,7 +271,8 @@ pub(crate) fn short_of_ram() -> bool {
     small_ram_host() || shared_band() >= Shared::Watch
 }
 
-/// Whether [`shared_band`] is High: the sweep lets go of what is kept spare.
+/// Whether [`shared_band`] is High: less is kept for sends and idle host
+/// lists (`crate::host`, `crate::list`).
 pub(crate) fn shared_high() -> bool {
     shared_band() == Shared::High
 }

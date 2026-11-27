@@ -118,25 +118,36 @@ unsafe impl Send for Memory {}
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
+/// Bytes of the memories out with submissions not given back yet
+/// ([`memory`], [`give_back`]; one dropped with its submission instead
+/// counts on, which [`kept_for`]'s 768 MiB bounds).
+static IN_AIR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// At most this much is kept (of the card's memory, with [`on_card`]):
-/// 128 MiB of the PC's while the memory it shares with the card is at 85 %
-/// of its budget (`crate::residency::shared_high`).
+/// less of the PC's while the memory it shares with the card is at 85 % of
+/// its budget (`crate::residency::shared_high`, [`kept_for`]).
 fn kept() -> u64 {
-    kept_for(on_card(), crate::residency::shared_high())
+    kept_for(on_card(), crate::residency::shared_high(), IN_AIR.load(Ordering::Relaxed))
 }
 
-fn kept_for(on_card: bool, high: bool) -> u64 {
+/// [`kept`] for where the memory lies, whether the shared memory is High,
+/// and the bytes out with submissions (`in_air`): in High as much as those
+/// (they come back to be taken again by the next submissions; kept fewer,
+/// the largest went at every give back and were made anew a frame later),
+/// at least 128 MiB, at most the 768 MiB kept otherwise.
+fn kept_for(on_card: bool, high: bool, in_air: u64) -> u64 {
+    const MOST: u64 = 768 << 20;
     if on_card {
         256 << 20
     } else if high {
-        128 << 20
+        in_air.clamp(128 << 20, MOST)
     } else {
-        768 << 20
+        MOST
     }
 }
 
 /// Lets go of what is kept past [`kept`], the largest first, as
-/// [`give_back`] does (the sweep, once a second).
+/// [`give_back`] does (the sweep, as the shared memory enters High).
 pub(super) fn trim() {
     let gone: Vec<Memory> = {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
@@ -177,7 +188,9 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         let fit = spare.iter().enumerate().filter(|(_, m)| m.size >= size).min_by_key(|(_, m)| m.size).map(|(i, _)| i);
         if let Some(i) = fit {
-            return Some(spare.swap_remove(i));
+            let memory = spare.swap_remove(i);
+            IN_AIR.fetch_add(memory.size, Ordering::Relaxed);
+            return Some(memory);
         }
     }
     // By doubles, so that the next of about this size finds it: what
@@ -189,6 +202,7 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
         None => host.upload_buffer(size)?,
     };
     name(&buffer, || "bytes a submission sends up".into());
+    IN_AIR.fetch_add(size, Ordering::Relaxed);
     Some(Memory {
         buffer,
         data: data as usize,
@@ -198,6 +212,8 @@ fn memory(host: &Host, size: u64) -> Option<Memory> {
 
 /// The submission has run.
 pub(super) fn give_back(memory: Memory) {
+    let size = memory.size;
+    let _ = IN_AIR.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n.saturating_sub(size)));
     let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
     spare.push(memory);
     spare.sort_by_key(|m| std::cmp::Reverse(m.size));
@@ -380,11 +396,18 @@ mod tests {
     use super::kept_for;
 
     #[test]
-    fn sends_keep_128_mib_while_the_shared_memory_is_high() {
-        assert_eq!(kept_for(false, false), 768 << 20);
-        assert_eq!(kept_for(false, true), 128 << 20);
+    fn sends_keep_what_is_in_the_air_while_the_shared_memory_is_high() {
+        const MIB: u64 = 1 << 20;
+        // Not High: 768 MiB, whatever is out.
+        assert_eq!(kept_for(false, false, 0), 768 * MIB);
+        assert_eq!(kept_for(false, false, 300 * MIB), 768 * MIB);
+        // High: what submissions hold, at least 128 MiB, at most 768.
+        assert_eq!(kept_for(false, true, 0), 128 * MIB);
+        assert_eq!(kept_for(false, true, 100 * MIB), 128 * MIB);
+        assert_eq!(kept_for(false, true, 300 * MIB), 300 * MIB);
+        assert_eq!(kept_for(false, true, 2048 * MIB), 768 * MIB);
         // The card's own memory is not the PC's.
-        assert_eq!(kept_for(true, true), 256 << 20);
-        assert_eq!(kept_for(true, false), 256 << 20);
+        assert_eq!(kept_for(true, true, 300 * MIB), 256 * MIB);
+        assert_eq!(kept_for(true, false, 0), 256 * MIB);
     }
 }
