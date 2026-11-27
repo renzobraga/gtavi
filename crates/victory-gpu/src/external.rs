@@ -17,7 +17,9 @@ pub fn host_device() -> Option<ID3D12Device> {
 /// The PCI vendor id and the name of the adapter the host device is on, as
 /// DXGI gives them; `None` without a host GPU or when DXGI does not name it.
 pub fn host_adapter() -> Option<(u32, String)> {
-    use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+    };
     let device = &crate::host::host()?.device;
     // SAFETY: plain queries.
     let desc = unsafe {

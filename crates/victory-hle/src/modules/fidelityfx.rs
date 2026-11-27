@@ -392,7 +392,11 @@ fn version_number(name: &str) -> Vec<u32> {
 
 /// The SDK supplies the version id to put in the context creation chain:
 /// FSR 4.1.2's, or with `any` the one [`pick_provider`] takes.
-fn select_version(query_fn: Call, device: &ID3D12Device, any: bool) -> Result<(u64, String), String> {
+fn select_version(
+    query_fn: Call,
+    device: &ID3D12Device,
+    any: bool,
+) -> Result<(u64, String), String> {
     let mut count = 0u64;
     let mut query = GetVersions {
         header: Header {
@@ -537,10 +541,7 @@ extern "C" fn ffxCreateContext(
         .then(|| unsafe { CStr::from_ptr(version.name) }.to_string_lossy());
     // (FSR 4.1.2, or with VICTORY_FSR_ANY_PROVIDER=1 the one asked for)
     let asked = |name: &str| is_fsr_4_1_2(name) || (any_provider() && name == host.provider);
-    if query_code != OK
-        || version.id != host.provider_id
-        || !name.as_deref().is_some_and(asked)
-    {
+    if query_code != OK || version.id != host.provider_id || !name.as_deref().is_some_and(asked) {
         tracing::warn!(
             query_code,
             provider = name.as_deref().unwrap_or("?"),
@@ -938,8 +939,14 @@ mod tests {
     fn fsr_4_is_refused_on_a_card_that_is_not_amds() {
         assert_eq!(not_for_adapter(0x1002, "AMD Radeon RX 7900 XTX"), None);
         let why = not_for_adapter(0x10de, "NVIDIA GeForce RTX 5060 Ti").unwrap();
-        assert!(why.contains("NVIDIA GeForce RTX 5060 Ti") && why.contains("0x10de"), "{why}");
-        assert!(why.contains("VICTORY_RENDER_SCALE") && why.contains("VICTORY_FSR_ANY_PROVIDER=1"), "{why}");
+        assert!(
+            why.contains("NVIDIA GeForce RTX 5060 Ti") && why.contains("0x10de"),
+            "{why}"
+        );
+        assert!(
+            why.contains("VICTORY_RENDER_SCALE") && why.contains("VICTORY_FSR_ANY_PROVIDER=1"),
+            "{why}"
+        );
         assert!(not_for_adapter(0x8086, "Intel(R) Arc(TM)").is_some());
     }
 
@@ -955,7 +962,11 @@ mod tests {
     }
 
     fn offered(names: &[&str]) -> Vec<(u64, String)> {
-        names.iter().enumerate().map(|(id, name)| (id as u64 + 100, (*name).to_owned())).collect()
+        names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| (id as u64 + 100, (*name).to_owned()))
+            .collect()
     }
 
     /// FSR 4.1.2 is taken wherever it is in the list; without it nothing,
