@@ -277,10 +277,7 @@ fn load(dir: &Path) -> Result<(Host, String), String> {
     };
     let device = victory_gpu::external::host_device().ok_or("there is no host GPU")?;
     let any = any_provider();
-    if !any
-        && let Some((vendor, name)) = victory_gpu::external::host_adapter()
-        && let Some(why) = not_for_adapter(vendor, &name)
-    {
+    if let Some(why) = refused_card() {
         return Err(why);
     }
     // SAFETY: the SDK's ffxQuery export, with its declared signature.
@@ -329,6 +326,21 @@ const INSTEAD: &str = "Leave -Fsr4K (VICTORY_FSR_4K) off: the title's own upscal
 /// card of 8 GB.
 pub fn any_provider() -> bool {
     std::env::var_os("VICTORY_FSR_ANY_PROVIDER").is_some_and(|v| v == "1")
+}
+
+/// Why the PC FSR 4 cannot run on the host card ([`not_for_adapter`]); `None`
+/// with `VICTORY_FSR_ANY_PROVIDER=1` ([`any_provider`]), on an AMD card (the
+/// DLL then says whether it has FSR 4.1.2 for it) and without a host GPU.
+/// Asked by the launcher (`-Fsr4K`) before it looks for the DLL, so that a
+/// card that cannot have it is told so first, and again before the DLL is
+/// asked ([`use_host_dir`]). Makes the host device when there is none yet,
+/// as loading the DLL would a moment later.
+pub fn refused_card() -> Option<String> {
+    if any_provider() {
+        return None;
+    }
+    let (vendor, name) = victory_gpu::external::host_adapter()?;
+    not_for_adapter(vendor, &name)
 }
 
 /// Why the PC FSR 4 cannot run on the host card of PCI vendor `vendor`, named
