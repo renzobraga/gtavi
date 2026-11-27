@@ -137,7 +137,7 @@ pub(crate) struct HostHeap {
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
     /// A view heap capped at [`PORTABLE_VIEWS`] ([`capped`]): its refused
-    /// tables are counted and told ([`CAPPED_REFUSED`]).
+    /// asks for dynamic slots are counted and told ([`CAPPED_REFUSED`]).
     capped: bool,
     sampler: bool,
     /// Where the raw twins of the title's slots start
@@ -1636,12 +1636,14 @@ fn capped(null: u32) -> bool {
     null != 0 && null < PORTABLE_VIEWS
 }
 
-/// Tables refused for want of free dynamic slots on capped heaps
-/// ([`capped`]) since the start: the draws and dispatches that read them are
-/// dropped. Counted only there.
+/// Asks for dynamic slots refused for want of free ones on capped heaps
+/// ([`capped`]) since the start. Each drops the draw or dispatch that asked
+/// (`draw.rs`: a table made afresh, a root view's one-view table, the views
+/// of title memory by address, `memory.rs`), and one draw may ask more than
+/// once: this is at least the number of draws so dropped. Counted only there.
 static CAPPED_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Whether the `n`th table refused on a capped heap is told: the 1st, the
+/// Whether the `n`th ask refused on a capped heap is told: the 1st, the
 /// 10th, the 100th and so on.
 fn told(n: u64) -> bool {
     n > 0 && 10u64.pow(n.ilog10()) == n
@@ -1732,8 +1734,9 @@ impl HostHeap {
                     dynamic_slots = extra,
                     "host view heaps are capped at {size} views (this card's most for a shader-visible heap): \
                      {count} of the title's {asked} slots and {extra} dynamic slots for the tables draws make \
-                     afresh (a card without the cap gets up to {}); a table that finds none free is refused \
-                     and the draws that read it are dropped, which the log counts (the 1st, 10th, 100th, ...)",
+                     afresh (a card without the cap gets up to {}); an ask that finds none free is refused \
+                     and the draw or dispatch that asked is dropped, which the log counts (the 1st, 10th, \
+                     100th, ...)",
                     DYNAMIC << 2
                 );
             });
@@ -1961,7 +1964,7 @@ impl HostHeap {
         Some(self.count + first as u32)
     }
 
-    /// A table [`HostHeap::dynamic`] refused: on a capped heap counted
+    /// An ask [`HostHeap::dynamic`] refused: on a capped heap counted
     /// ([`CAPPED_REFUSED`]) and told at the 1st, 10th, 100th, ... Nothing
     /// on others.
     fn refused(&self) {
@@ -1973,8 +1976,9 @@ impl HostHeap {
             tracing::warn!(
                 refused = n,
                 dynamic_slots = self.dynamic,
-                "tables refused so far for want of free dynamic view slots on a view heap capped at \
-                 {PORTABLE_VIEWS} views: the draws and dispatches that read them are dropped"
+                "asks for dynamic view slots refused so far for want of free ones on a view heap capped \
+                 at {PORTABLE_VIEWS} views (tables, root views, views of title memory by address): each \
+                 drops the draw or dispatch that asked, and a draw may ask more than once"
             );
         }
     }
