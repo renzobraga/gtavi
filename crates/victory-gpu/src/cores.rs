@@ -253,6 +253,21 @@ fn lane_core() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_CORE").is_some_and(|v| v == "1"))
 }
 
+/// Whether [`lane_core`] is asked for at all (`VICTORY_LANE_CORE=1`, or the
+/// switch turned on and off while the title runs). Where all cores are of
+/// one kind (a Ryzen 5 7600X's six) no thread of ours asks for processors,
+/// so the submitting thread was never told of its core and the switch did
+/// nothing: there the submitting thread asks then, and no other. A core of
+/// six kept for one thread is a sixth of the processor: it stays a thing to
+/// try, off by default.
+fn lane_core_asked() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_LANE_CORE").is_some() {
+        return true;
+    }
+    lane_core()
+}
+
 /// Threads that asked: a handle of each, and whether it is the submitting one.
 static ASKED: std::sync::Mutex<Vec<(usize, bool)>> = std::sync::Mutex::new(Vec::new());
 
@@ -282,8 +297,11 @@ pub(crate) fn settle() {
             Some((own, _)) if lane => own,
             _ => &helpers,
         };
+        // (None: what it was told is taken back. Only where all cores are
+        // alike, the submitting thread's when its core is not kept.)
+        let at = if sets.is_empty() { null } else { sets.as_ptr() };
         // SAFETY: a handle kept open, and the system's own set ids.
-        unsafe { SetThreadSelectedCpuSets(thread as _, sets.as_ptr(), sets.len() as u32) };
+        unsafe { SetThreadSelectedCpuSets(thread as _, at, sets.len() as u32) };
     }
     tracing::info!(on = one.is_some(), core = ?one.as_ref().map(|o| &o.0), "the submitting thread has a core of its own (VICTORY_LANE_CORE)");
     tracing::info!(
@@ -340,8 +358,9 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    // All alike (or nothing known): nothing to ask for, but for the
+    // submitting thread's own core where it is asked for.
+    if fast.is_empty() && !(what == "victory-submit" && lane_core_asked()) {
         return;
     }
     // SAFETY: our own thread; the handle stays open.
@@ -412,6 +431,18 @@ mod tests {
         let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
         assert!((1..=logical).contains(&physical_cores()));
         assert_eq!(small_cpu(), small_cpu_of(logical));
+    }
+
+    #[test]
+    fn six_cores_alike_have_a_core_for_the_submitting_thread() {
+        // A Ryzen 5 7600X: twelve sets of one class, two to a core. No fast
+        // sets, but one core of the six and the five others.
+        let sets = alike(12);
+        assert!(fast_by_class(&sets).is_empty());
+        let (own, others) = one_core(&sets).unwrap();
+        assert_eq!((own, others.len()), (vec![266, 267], 10));
+        // Four cores: none.
+        assert!(one_core(&alike(8)).is_none());
     }
 
     #[test]
