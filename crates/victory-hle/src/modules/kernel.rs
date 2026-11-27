@@ -414,7 +414,9 @@ pub extern "C" fn __p___argv() -> *mut *mut *mut c_char {
 /// one of them busy such a thread ran once in four seconds or so, when the
 /// host's scheduler took pity, and the loading that waits for it with it
 /// (run stream-3: loads seen to be done 1.1 s late on average, 4.8 s at
-/// worst). `VICTORY_TITLE_PRIORITIES=0`: as the title sets them.
+/// worst). `VICTORY_TITLE_PRIORITIES=0`: as the title sets them;
+/// `VICTORY_TITLE_PRIORITIES=auto`: as the title sets them but on a small
+/// processor ([`as_set`]).
 fn title_priority(asked: i32) -> i32 {
     const IDLE: i32 = -15;
     const LOWEST: i32 = -2;
@@ -425,10 +427,25 @@ fn title_priority(asked: i32) -> i32 {
     }
 }
 
+/// Whether the title's thread priorities are left as it sets them
+/// (`VICTORY_TITLE_PRIORITIES`): `0`, yes; `auto`, yes but on a small
+/// processor (`victory_gpu::small_cpu`: under 16 logical ones); anything
+/// else, or nothing, no ([`title_priority`]). The launcher plays with `0`
+/// on 24 logical processors; on 12 the title's threads and ours are more
+/// than there are processors, and an idle thread can wait seconds at a
+/// time, as it did in run stream-3 with every one of them busy.
+fn as_set(asked: Option<&str>, small: bool) -> bool {
+    match asked.map(str::trim) {
+        Some("0") => true,
+        Some("auto") => !small,
+        _ => false,
+    }
+}
+
 /// [`title_priority`].
 pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32 {
     static AS_SET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let as_set = *AS_SET.get_or_init(|| std::env::var_os("VICTORY_TITLE_PRIORITIES").is_some_and(|v| v == "0"));
+    let as_set = *AS_SET.get_or_init(|| as_set(std::env::var("VICTORY_TITLE_PRIORITIES").ok().as_deref(), victory_gpu::small_cpu()));
     let priority = if as_set { priority } else { title_priority(priority) };
     // SAFETY: the title passes a thread handle.
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
@@ -682,6 +699,17 @@ mod host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `0` leaves them as set; `auto` too, but on a small processor;
+    /// anything else lifts them.
+    #[test]
+    fn the_title_priorities_are_left_as_asked() {
+        assert!(as_set(Some("0"), false) && as_set(Some("0"), true));
+        assert!(as_set(Some("auto"), false));
+        assert!(!as_set(Some(" auto "), true));
+        assert!(!as_set(None, false) && !as_set(None, true));
+        assert!(!as_set(Some("1"), false));
+    }
 
     /// The title's idle and lowest threads run below normal; the others as
     /// it sets them.

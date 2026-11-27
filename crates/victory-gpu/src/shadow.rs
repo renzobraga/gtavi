@@ -1509,6 +1509,31 @@ fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
+/// Whether the threads kept for [`wide`] run above normal priority, as the
+/// submitting thread does (`VICTORY_WIDE_ABOVE=1`; `0`: at normal priority,
+/// as before; unset: on a small processor, `crate::cores::small_cpu`).
+///
+/// The submitting thread hands them its refreshes, compares and copies and
+/// waits for the last of them to be done. At normal priority they share
+/// the processors with every other thread at it (the title's, those that
+/// translate lists, streaming's); with 24 logical processors one was
+/// mostly free, with 12 the thread above them waits for whichever is
+/// last to get one. They sleep between such work, so they take nothing
+/// from the others but while they are waited for.
+fn wide_above() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| wide_above_wanted(std::env::var("VICTORY_WIDE_ABOVE").ok().as_deref(), crate::cores::small_cpu()))
+}
+
+/// [`wide_above`]: as asked, else on a small processor.
+fn wide_above_wanted(asked: Option<&str>, small: bool) -> bool {
+    match asked.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => small,
+    }
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1521,6 +1546,11 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                if wide_above() {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+                    // SAFETY: this thread's own priority.
+                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+                }
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
