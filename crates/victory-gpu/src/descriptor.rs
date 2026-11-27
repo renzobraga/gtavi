@@ -419,9 +419,11 @@ pub(crate) fn sync_heaps() {
         kinds[4] += before.len() as u64 - of_tables;
         // Those of the changed pages, made together at the end.
         let mut make: Vec<u32> = Vec::new();
-        // Ranges of the heap to look at, and whether a range is one the
-        // fallback of renderer port #2 looks at whole.
-        let mut parts: Vec<(usize, usize, bool)> = Vec::new();
+        // Ranges of the heap to look at, whether a range is one the
+        // fallback of renderer port #2 looks at whole, and the page it
+        // counts as (once a page: none for a run of marks, nor for the
+        // fallback's second and later pieces of a page).
+        let mut parts: Vec<(usize, usize, bool, Option<(usize, usize)>)> = Vec::new();
         let port = crate::port_descriptors::adopted(start);
         if port {
             // Renderer port #2: the slots the title's patched stores and our
@@ -430,7 +432,7 @@ pub(crate) fn sync_heaps() {
             let phase = crate::timeline::span("the heaps' records: the marks taken (renderer port 2)");
             for (first, n) in crate::port_descriptors::take(start).unwrap_or_default() {
                 let from = start as usize + first as usize * step as usize;
-                parts.push((from, from + n as usize * step as usize, false));
+                parts.push((from, from + n as usize * step as usize, false, None));
             }
             phase.end();
             if crate::port_descriptors::ask_due(frame) {
@@ -446,21 +448,22 @@ pub(crate) fn sync_heaps() {
             // parts that run at once, and a record told and taken this round
             // is not counted as one no store told of. The runs are in
             // order and apart, as `take` makes them.)
-            let marked: Vec<(usize, usize)> = parts.iter().map(|&(from, to, _)| (from, to)).collect();
+            let marked: Vec<(usize, usize)> = parts.iter().map(|&(from, to, ..)| (from, to)).collect();
             for page in crate::port_descriptors::to_check(frame) {
                 let (mut from, to) = (page.max(start as usize), (page + crate::watch::PAGE).min(end as usize));
+                let mut counted = Some((from, to)).filter(|(from, to)| from < to);
                 let mut i = marked.partition_point(|&(_, run_end)| run_end <= from);
                 while from < to {
                     match marked.get(i) {
                         Some(&(run, run_end)) if run < to => {
                             if from < run {
-                                parts.push((from, run, true));
+                                parts.push((from, run, true, counted.take()));
                             }
                             from = from.max(run_end);
                             i += 1;
                         }
                         _ => {
-                            parts.push((from, to, true));
+                            parts.push((from, to, true, counted.take()));
                             break;
                         }
                     }
@@ -475,7 +478,8 @@ pub(crate) fn sync_heaps() {
             for (range_from, range_end) in taken {
                 let mut page = range_from & !(crate::watch::PAGE - 1);
                 while page < range_end {
-                    parts.push((page.max(range_from), (page + crate::watch::PAGE).min(range_end), false));
+                    let (from, to) = (page.max(range_from), (page + crate::watch::PAGE).min(range_end));
+                    parts.push((from, to, false, Some((from, to))));
                     page += crate::watch::PAGE;
                 }
             }
@@ -496,7 +500,7 @@ pub(crate) fn sync_heaps() {
             let mut page_bytes: Vec<u8> = Vec::new();
             let mut changed: Vec<u32> = Vec::new();
             let mut bits: Vec<u64> = Vec::new();
-            for &(from, to, check) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
+            for &(from, to, check, page) in parts.chunks(pages_a_job).nth(n).unwrap_or_default() {
                 let checking = check.then(std::time::Instant::now);
                 let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                 // A record that straddles the range's ends is left
@@ -513,10 +517,11 @@ pub(crate) fn sync_heaps() {
                     // fails where a page is not there.
                     let whole = unsafe { copied.changes_in_place(first as u32, lead as *const u8, count as usize, &mut bits, &mut changed) };
                     out.ns[1] += since(at);
-                    // (A run of marked slots is no page; nor does it ask the guards.)
-                    if !port || check {
+                    // (A run of marked slots is no page; nor does it ask the
+                    // guards. A page the fallback looks at in pieces, once.)
+                    if let Some((page_from, page_to)) = page {
                         out.pages += 1;
-                        out.views += u64::from(crate::watch::guarded(from, to));
+                        out.views += u64::from(crate::watch::guarded(page_from, page_to));
                     }
                     out.bytes += (to - from) as u64;
                     out.looked += count;
@@ -536,8 +541,10 @@ pub(crate) fn sync_heaps() {
                         continue;
                     }
                     out.ns[0] += since(at);
-                    out.pages += 1;
-                    out.views += u64::from(crate::watch::guarded(from, to));
+                    if let Some((page_from, page_to)) = page {
+                        out.pages += 1;
+                        out.views += u64::from(crate::watch::guarded(page_from, page_to));
+                    }
                     out.bytes += (to - from) as u64;
                     let Some(records) = page_bytes.get(lead.wrapping_sub(from)..) else {
                         continue;

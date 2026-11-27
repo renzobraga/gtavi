@@ -399,38 +399,63 @@ unsafe fn copied(to: *mut u8, from: *const u8, n: usize, real: usize) -> *mut u8
 }
 
 /// Our own write of `len` bytes at `at` (a copy of a submission's, done on
-/// the CPU), if it touches the marked heap: each slot whose first word lies
-/// in it and is now a view's is marked, as the title's `memcpy` marks them
-/// ([`copied`]). Without it the records round under the switch looks only
-/// at marked slots and the fallback's few pages, so a view record our copy
-/// put there waited for the fallback, up to many frames, and a draw that
-/// picked it by index read the old one. Read by a copy that fails where
-/// title memory is not there (`crate::host::read_there`: zeros, no view).
-pub(crate) fn mark_written(at: usize, len: usize) {
+/// the CPU), if it touches the marked heap: each record it touches, wholly
+/// or in part, that is now a view's is marked, as the title's `memcpy`
+/// marks them ([`copied`]). Without it the records round under the switch
+/// looks only at marked slots and the fallback's few pages, so a view
+/// record our copy put there waited for the fallback, up to many frames,
+/// and a draw that picked it by index read the old one. Read in pieces of
+/// 64 KiB by a copy that fails where title memory is not there
+/// (`crate::host::read_there`: zeros, no view). Whether the write touched
+/// the marked heap: the caller then asks for a round begun after the marks
+/// (`crate::port_journal::prep_wrote`).
+pub(crate) fn mark_written(at: usize, len: usize) -> bool {
     let heap = MARKS.len.load(Acquire);
-    if heap == 0 || len < 4 {
-        return;
+    if heap == 0 || len == 0 {
+        return false;
     }
     let start = MARKS.start.load(Relaxed);
     let (lo, hi) = ((at as u64).max(start), (at as u64).saturating_add(len as u64).min(start + heap));
     if lo >= hi {
-        return;
+        return false;
     }
-    let first = (lo - start).div_ceil(32);
-    let from = start + first * 32;
-    if from + 4 > hi {
-        return;
-    }
-    let mut bytes = vec![0u8; (hi - from) as usize];
-    crate::host::read_there(from as *const u8, &mut bytes);
+    // The records that hold its first and last bytes, whole.
+    let first = (lo - start) / 32;
+    let end = ((hi - start).div_ceil(32) * 32).min(heap);
+    const PIECE: u64 = 64 << 10;
+    let mut bytes = vec![0u8; (end - first * 32).min(PIECE) as usize];
     let mut marked = 0;
-    for (i, record) in bytes.chunks(32).enumerate() {
-        if record.starts_with(&crate::descriptor::VIEW_TAG.to_le_bytes()) {
-            mark_slot(first as usize + i);
-            marked += 1;
+    let mut slot = first;
+    while slot * 32 < end {
+        let n = ((end - slot * 32).min(PIECE)) as usize;
+        let piece = &mut bytes[..n];
+        crate::host::read_there((start + slot * 32) as *const u8, piece);
+        for (i, record) in piece.chunks(32).enumerate() {
+            if record.starts_with(&crate::descriptor::VIEW_TAG.to_le_bytes()) {
+                mark_slot(slot as usize + i);
+                marked += 1;
+            }
         }
+        slot += (n / 32) as u64;
     }
     MARKED_BY_US.fetch_add(marked, Relaxed);
+    true
+}
+
+/// A write into the marked heap that lands later, on the card (a copy the
+/// card steps do, a placed copy left to the card while flights in the air
+/// touch it): its pages go to the fallback, which looks at them whole in a
+/// few frames, since nothing marks what it puts there.
+pub(crate) fn check_soon(at: usize, len: usize) {
+    let heap = MARKS.len.load(Acquire);
+    if heap == 0 || len == 0 {
+        return;
+    }
+    let start = MARKS.start.load(Relaxed) as usize;
+    let (lo, hi) = (at.max(start), at.saturating_add(len).min(start + heap as usize));
+    if lo < hi {
+        asked(&[(lo, hi)]);
+    }
 }
 
 /// Marks slot `slot` of the marked heap (in it: checked by the caller).

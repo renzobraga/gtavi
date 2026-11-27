@@ -7835,6 +7835,14 @@ impl HostList {
         let mut textures: Vec<crate::texture::PreludeUpload> = Vec::new();
         for (i, step) in self.deferred().copies.iter().enumerate() {
             if matches!(step, Step::Copy(..) | Step::Fill(..)) && taken(i) {
+                // (Done on the card: renderer port #2 cannot mark the view
+                // records it puts into the marked heap, so its pages go to
+                // the fallback.)
+                if let &Step::Copy(dst, _, len) | &Step::Fill(dst, _, len, _) = step
+                    && crate::port_descriptors::on()
+                {
+                    crate::port_descriptors::check_soon(dst, len);
+                }
                 continue;
             }
             let (started, copied) = match step {
@@ -7856,9 +7864,10 @@ impl HostList {
                         crate::port_journal::prep_wrote();
                     }
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
-                    // Renderer port #2: the view records it put there.
-                    if crate::port_descriptors::on() {
-                        crate::port_descriptors::mark_written(dst, len);
+                    // Renderer port #2: the view records it put there, and
+                    // (port #7) a round begun after those marks for the next.
+                    if crate::port_descriptors::on() && crate::port_descriptors::mark_written(dst, len) {
+                        crate::port_journal::prep_wrote();
                     }
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7900,10 +7909,16 @@ impl HostList {
                     if let Some(bytes) = p.prepare(free) {
                         batch.placed.push((p.shadow.clone(), p.dst, bytes));
                     }
-                    // Renderer port #2: the view records it put there (a copy
-                    // left to the card marks the slots that held views).
+                    // Renderer port #2: the view records it put there, and
+                    // (port #7) a round begun after those marks for the next;
+                    // a copy left to the card lands later, unmarked: its pages
+                    // go to the fallback.
                     if crate::port_descriptors::on() {
-                        crate::port_descriptors::mark_written(p.dst, p.len);
+                        if !free {
+                            crate::port_descriptors::check_soon(p.dst, p.len);
+                        } else if crate::port_descriptors::mark_written(p.dst, p.len) {
+                            crate::port_journal::prep_wrote();
+                        }
                     }
                     (started, p.len)
                 }
