@@ -134,6 +134,95 @@ std::arch::global_asm!(
     "mov qword ptr [rax + 8], r11",
     "mov rax, r9",
     "ret",
+    // The two above with AVX-512 (F, VL) for the stores of some dwords of
+    // a block ([`crate::cores::avx512`]): the mask of the dwords goes into a
+    // mask register and the store is one under it, where it was
+    // `vpmaskmovd`, which AMD's Zen cores run as a string of micro-ops.
+    // Everything else is as above, instruction for instruction. A dword the
+    // mask leaves out is neither stored nor faults (AMD's manual leaves it
+    // to the processor whether `vpmaskmovd`'s fault).
+    ".globl victory_safe_put512",
+    ".globl victory_safe_put512_at",
+    ".globl victory_safe_put512_after",
+    ".globl victory_safe_put512_failed",
+    "victory_safe_put512:",
+    "test r9, r9",
+    "jz 4f",
+    "2:",
+    "vmovdqu ymm1, ymmword ptr [r8]",
+    "vpcmpeqd ymm2, ymm1, ymmword ptr [rdx]",
+    "vmovmskps eax, ymm2",
+    "xor eax, 255",
+    "jz 3f",
+    "kmovw k1, eax",
+    "victory_safe_put512_at:",
+    "vmovdqu32 ymmword ptr [rcx] {{k1}}, ymm1",
+    "victory_safe_put512_after:",
+    "nop",
+    "3:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "vzeroupper",
+    "4:",
+    "mov eax, 1",
+    "ret",
+    "victory_safe_put512_failed:",
+    "vzeroupper",
+    "xor eax, eax",
+    "ret",
+    ".globl victory_safe_merge512",
+    ".globl victory_safe_merge512_at",
+    ".globl victory_safe_merge512_after",
+    ".globl victory_safe_merge512_failed",
+    "victory_safe_merge512:",
+    "xor r10d, r10d",
+    "xor r11d, r11d",
+    "test r9, r9",
+    "jz 6f",
+    "2:",
+    "vmovdqu ymm0, ymmword ptr [rdx]",
+    "vpcmpeqb ymm1, ymm0, ymmword ptr [r8]",
+    "vpmovmskb eax, ymm1",
+    "cmp eax, -1",
+    "je 5f",
+    "victory_safe_merge512_at:",
+    "vmovdqu ymm2, ymmword ptr [rcx]",
+    "vpblendvb ymm3, ymm0, ymm2, ymm1",
+    "vpcmpeqd ymm4, ymm3, ymm2",
+    "vmovmskps eax, ymm4",
+    "xor eax, 255",
+    "jz 4f",
+    "cmp eax, 255",
+    "je 3f",
+    "kmovw k1, eax",
+    "vmovdqu32 ymmword ptr [rcx] {{k1}}, ymm3",
+    "jmp 7f",
+    "3:",
+    "vmovdqu ymmword ptr [rcx], ymm3",
+    "victory_safe_merge512_after:",
+    "7:",
+    "popcnt eax, eax",
+    "add r11, rax",
+    "4:",
+    "inc r10",
+    "vmovdqu ymmword ptr [r8], ymm0",
+    "5:",
+    "add rcx, 32",
+    "add rdx, 32",
+    "add r8, 32",
+    "dec r9",
+    "jnz 2b",
+    "6:",
+    "victory_safe_merge512_failed:",
+    "vzeroupper",
+    "mov rax, qword ptr [rsp + 40]",
+    "mov qword ptr [rax], r10",
+    "mov qword ptr [rax + 8], r11",
+    "mov rax, r9",
+    "ret",
     ".globl victory_safe_changed",
     ".globl victory_safe_changed_at",
     ".globl victory_safe_changed_after",
@@ -186,10 +275,47 @@ unsafe extern "system" {
     fn victory_safe_merge_at();
     fn victory_safe_merge_after();
     fn victory_safe_merge_failed();
+    fn victory_safe_put512(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32;
+    fn victory_safe_put512_at();
+    fn victory_safe_put512_after();
+    fn victory_safe_put512_failed();
+    fn victory_safe_merge512(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: *mut [u64; 2]) -> usize;
+    fn victory_safe_merge512_at();
+    fn victory_safe_merge512_after();
+    fn victory_safe_merge512_failed();
     fn victory_safe_changed(title: *const u8, seen: *mut u8, records: usize, bits: *mut u64) -> u32;
     fn victory_safe_changed_at();
     fn victory_safe_changed_after();
     fn victory_safe_changed_failed();
+}
+
+/// `victory_safe_put`, or its AVX-512 twin where [`crate::cores::avx512`]
+/// says so: the same stores, the same faults.
+///
+/// # Safety
+/// As the kernel's: `was` and `now` hold `blocks` blocks of 32 bytes, `dst`
+/// is as [`copy`]'s destination.
+unsafe fn put_blocks(dst: *mut u8, was: *const u8, now: *const u8, blocks: usize) -> u32 {
+    // SAFETY: the caller's; the twin's processor has AVX-512 F and VL.
+    unsafe {
+        if crate::cores::avx512() { victory_safe_put512(dst, was, now, blocks) } else { victory_safe_put(dst, was, now, blocks) }
+    }
+}
+
+/// `victory_safe_merge`, or its AVX-512 twin, as [`put_blocks`].
+///
+/// # Safety
+/// As the kernel's: `now` and `held` hold `blocks` blocks of 32 bytes,
+/// `title` is as [`copy`]'s destination.
+unsafe fn merge_blocks(title: *mut u8, now: *const u8, held: *mut u8, blocks: usize, counts: &mut [u64; 2]) -> usize {
+    // SAFETY: as above.
+    unsafe {
+        if crate::cores::avx512() {
+            victory_safe_merge512(title, now, held, blocks, counts)
+        } else {
+            victory_safe_merge(title, now, held, blocks, counts)
+        }
+    }
 }
 
 /// The records of 32 bytes at `title` (`records` of them) that differ from
@@ -276,7 +402,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
             unsafe {
                 std::ptr::copy_nonoverlapping(now.add(at), new.as_mut_ptr().add(into), n);
                 std::ptr::copy_nonoverlapping(held.add(at), old.as_mut_ptr().add(into), n);
-                let stuck = victory_safe_merge(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
+                let stuck = merge_blocks(title.wrapping_add(at).wrapping_sub(into), new.as_ptr(), old.as_mut_ptr(), 1, &mut counts);
                 out.there &= stuck == 0;
                 let from = if stuck != 0 && take { new.as_ptr() } else { old.as_ptr() };
                 std::ptr::copy_nonoverlapping(from.add(into), held.add(at), n);
@@ -285,7 +411,7 @@ pub(crate) unsafe fn merge(title: *mut u8, now: *const u8, held: *mut u8, len: u
         } else {
             let blocks = left / 32;
             // SAFETY: whole blocks of the stretch.
-            let stuck = unsafe { victory_safe_merge(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
+            let stuck = unsafe { merge_blocks(title.add(at), now.add(at), held.add(at), blocks, &mut counts) };
             if stuck != 0 {
                 out.there = false;
                 if take {
@@ -355,7 +481,7 @@ pub(crate) unsafe fn put_changed(dst: *mut u8, was: &[u8], now: &[u8]) -> bool {
     if blocks > 0 {
         // SAFETY: the two slices hold the blocks; the destination's faults
         // leave through the failing exit.
-        all &= unsafe { victory_safe_put(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
+        all &= unsafe { put_blocks(dst.add(head), was[head..].as_ptr(), now[head..].as_ptr(), blocks) != 0 };
     }
     let single = |from: usize, to: usize| {
         let mut all = true;
@@ -411,6 +537,14 @@ pub(crate) fn failing_exit(at: usize) -> Option<usize> {
     let (from, to) = (victory_safe_put_at as *const () as usize, victory_safe_put_after as *const () as usize);
     if (from..to).contains(&at) {
         return Some(victory_safe_put_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_put512_at as *const () as usize, victory_safe_put512_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_put512_failed as *const () as usize);
+    }
+    let (from, to) = (victory_safe_merge512_at as *const () as usize, victory_safe_merge512_after as *const () as usize);
+    if (from..to).contains(&at) {
+        return Some(victory_safe_merge512_failed as *const () as usize);
     }
     let (from, to) = (victory_safe_changed_at as *const () as usize, victory_safe_changed_after as *const () as usize);
     if (from..to).contains(&at) {
@@ -715,6 +849,83 @@ mod tests {
                 w.join().expect("no write was undone");
             }
         });
+    }
+
+    /// The AVX-512 twins of the put and the merge store what the others do,
+    /// count what they count and fail where they fail: blocks of every kind
+    /// of change over title memory with bytes of its own, inside a page or
+    /// across into one that is there, is not there or is read-only. (Where
+    /// the processor has no AVX-512 there is nothing to compare.)
+    #[test]
+    fn the_avx512_twins_do_what_the_others_do() {
+        if !(std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl"))
+        {
+            return;
+        }
+        assert!(on());
+        type Put = unsafe extern "system" fn(*mut u8, *const u8, *const u8, usize) -> u32;
+        type Merge = unsafe extern "system" fn(*mut u8, *const u8, *mut u8, usize, *mut [u64; 2]) -> usize;
+        let puts: [Put; 2] = [victory_safe_put, victory_safe_put512];
+        let merges: [Merge; 2] = [victory_safe_merge, victory_safe_merge512];
+        let pages = Pages::new(2 << 12);
+        let second = pages.0.wrapping_add(4096);
+        let mut seed = 0x51ed_270b_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        for round in 0..3000usize {
+            let blocks = next() % 20;
+            let bytes = blocks * 32;
+            // Inside the first page, or across into the second.
+            let start = if round % 2 == 0 { next() % 64 * 4 } else { 4096 - next() % (bytes + 1) / 4 * 4 };
+            let held: Vec<u8> = (0..bytes).map(|_| next() as u8).collect();
+            let mut now = held.clone();
+            for _ in 0..next() % 40 {
+                if bytes > 0 {
+                    now[next() % bytes] = next() as u8;
+                }
+            }
+            if round % 5 == 0 {
+                now.iter_mut().for_each(|b| *b = b.wrapping_add(1));
+            }
+            let title: Vec<u8> = (0..2 << 12).map(|_| next() as u8).collect();
+            // The second page: there, not there, read-only.
+            let kind = round / 2 % 3;
+            // SAFETY: our allocation, whole; the vectors are ours.
+            let setup = || unsafe {
+                VirtualAlloc(second.cast(), 4096, MEM_COMMIT, PAGE_READWRITE);
+                VirtualProtect(second.cast(), 4096, PAGE_READWRITE, &mut 0);
+                std::ptr::copy_nonoverlapping(title.as_ptr(), pages.0, title.len());
+                match kind {
+                    1 => assert_ne!(VirtualFree(second.cast(), 4096, MEM_DECOMMIT), 0),
+                    2 => assert_ne!(VirtualProtect(second.cast(), 4096, PAGE_READONLY, &mut 0), 0),
+                    _ => {}
+                }
+            };
+            // SAFETY: the first page, and the second where it can be read.
+            let there = || unsafe { std::slice::from_raw_parts(pages.0, if kind == 1 { 4096 } else { 8192 }).to_vec() };
+            let mut outcomes = Vec::new();
+            for k in 0..2 {
+                setup();
+                // SAFETY: the blocks are inside the vectors; title memory's
+                // faults leave through the failing exits.
+                let put = unsafe { puts[k](pages.0.add(start), held.as_ptr(), now.as_ptr(), blocks) };
+                let after_put = there();
+                setup();
+                let (mut kept, mut counts) = (held.clone(), [0u64; 2]);
+                // SAFETY: as above.
+                let left = unsafe { merges[k](pages.0.add(start), now.as_ptr(), kept.as_mut_ptr(), blocks, &mut counts) };
+                outcomes.push((put, after_put, left, counts, kept, there()));
+            }
+            assert!(outcomes[0] == outcomes[1], "round {round}: start {start}, {blocks} blocks, second page {kind}");
+        }
+        // SAFETY: our allocation, as it was.
+        unsafe { VirtualAlloc(second.cast(), 4096, MEM_COMMIT, PAGE_READWRITE) };
     }
 
     #[test]

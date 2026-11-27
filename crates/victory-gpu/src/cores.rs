@@ -3,7 +3,8 @@
 //! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this).
 //!
 //! Also what our pools are sized by on a processor with few of them
-//! ([`small_cpu`], [`physical_cores`]).
+//! ([`small_cpu`], [`physical_cores`]), and whether our vector kernels use
+//! AVX-512 ([`avx512`]).
 
 /// Logical processors under which a processor counts as a small one: the
 /// threads of ours were counted for 24 (i9-12900K), and a six-core processor
@@ -80,6 +81,36 @@ fn cores_of_group_0() -> usize {
         at += info.Size as usize;
     }
     cores
+}
+
+/// Whether our own vector kernels use AVX-512 (F, BW and VL) where the
+/// processor has it (`VICTORY_SIMD=avx2`: the AVX2 ones, as on a processor
+/// without it, for an A/B; on by default where it is there). The stores of
+/// title memory that leave dwords beside them alone
+/// (`crate::safecopy::put_changed`, `crate::safecopy::merge`) were
+/// `vpmaskmovd`, which AMD's Zen cores run as a long string of micro-ops,
+/// against one store under a mask register; the compares of
+/// `crate::shadow` take 64 bytes at a time and give their masks directly.
+/// The i9-12900K has no AVX-512: nothing changes there. (On an Intel
+/// processor whose cores slow down for 512-bit work, `VICTORY_SIMD=avx2` is
+/// the thing to try.)
+pub(crate) fn avx512() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let there = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        let on = avx512_wanted(std::env::var("VICTORY_SIMD").ok().as_deref(), there);
+        if there {
+            tracing::info!(on, "our vector kernels: AVX-512 where the processor has it (VICTORY_SIMD=avx2: AVX2)");
+        }
+        on
+    })
+}
+
+/// [`avx512`]: as asked (`VICTORY_SIMD`), where the processor has it.
+fn avx512_wanted(asked: Option<&str>, there: bool) -> bool {
+    there && !asked.is_some_and(|v| v.trim().eq_ignore_ascii_case("avx2"))
 }
 
 /// The system's processor sets of group 0: each one's id, its efficiency
@@ -431,6 +462,16 @@ mod tests {
         let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
         assert!((1..=logical).contains(&physical_cores()));
         assert_eq!(small_cpu(), small_cpu_of(logical));
+    }
+
+    #[test]
+    fn avx512_is_used_where_it_is_there_unless_avx2_is_asked_for() {
+        assert!(avx512_wanted(None, true));
+        assert!(avx512_wanted(Some("avx512"), true));
+        assert!(!avx512_wanted(Some("avx2"), true));
+        assert!(!avx512_wanted(Some(" AVX2 "), true));
+        assert!(!avx512_wanted(None, false));
+        assert!(!avx512_wanted(Some("avx512"), false));
     }
 
     #[test]
