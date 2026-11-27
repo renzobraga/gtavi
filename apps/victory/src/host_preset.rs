@@ -6,12 +6,14 @@
 //! - The console profile when `--console` is not given (`auto`): Series S on
 //!   a PC with 24 GiB of RAM or less or a card with 10 GiB of its own or
 //!   less, Series X otherwise, and always with FSR 4K ([`choose_console`]).
+//!   On a card other than AMD's the Series S it chooses comes with the
+//!   title's own upscaler ([`defaults`]).
 //! - Defaults for switches that are there already, each set only where it is
 //!   not set and said once with its reason ([`defaults`]). A value set by
 //!   hand always stays.
 //! - Warnings, which refuse nothing: a commit limit too low for a run on a PC
 //!   with little RAM, and a render size whose tile lists a card other than
-//!   AMD's runs cut ([`warnings`]).
+//!   AMD's runs cut unless `VICTORY_INDIRECT_WIDE=1` ([`warnings`]).
 //!
 //! `VICTORY_HOST_PRESET=0`: none of it (Series X unless `--console` says
 //! otherwise, no defaults, as before the preset); what the PC is and the
@@ -50,9 +52,10 @@ const COMMIT_ABOVE_RAM: u64 = 24 * GIB;
 
 /// The most groups an indirect dispatch runs on a card other than AMD's
 /// (`victory-gpu` `indirect.rs`, `widest`: 65,535 is the most D3D12 names
-/// for a dispatch). The title's tile lists are dispatches of one group per
-/// tile of 8x4 pixels, so past 65,535 tiles (2,097,120 pixels) of a render
-/// size the last ones can be cut: blocky patches, the lowest of the picture.
+/// for a dispatch), unless [`wide`]. The title's tile lists are dispatches of
+/// one group per tile of 8x4 pixels, so past 65,535 tiles (2,097,120 pixels)
+/// of a render size the last ones can be cut: blocky patches, the lowest of
+/// the picture.
 const MOST_GROUPS: u64 = 65_535;
 
 /// What the PC is, as far as the preset goes by it; `None` where it could
@@ -150,9 +153,10 @@ pub(crate) fn decide(
     let off = env("VICTORY_HOST_PRESET").is_some_and(|v| v.trim() == "0");
     let (console, console_why) =
         choose_console(asked.console, off, asked.fsr_input.is_some(), probe);
+    let chosen = matches!(asked.console, Console::Auto);
     let (mut set, mut kept) = (Vec::new(), Vec::new());
     if !off {
-        for (name, value, why) in defaults(probe, console) {
+        for (name, value, why) in defaults(probe, console, chosen) {
             match env(name) {
                 Some(theirs) => kept.push((name, theirs, value)),
                 None => set.push((name, value, why)),
@@ -222,9 +226,14 @@ fn choose_console(
     )
 }
 
-/// The defaults that follow from the PC and the profile: name, value, why.
-/// Each is a switch read where its doc comment says what it does.
-fn defaults(probe: &Probe, console: Profile) -> Vec<(&'static str, &'static str, &'static str)> {
+/// The defaults that follow from the PC and the profile, `chosen` when the
+/// preset chose it (`--console` not given): name, value, why. Each is a
+/// switch read where its doc comment says what it does.
+fn defaults(
+    probe: &Probe,
+    console: Profile,
+    chosen: bool,
+) -> Vec<(&'static str, &'static str, &'static str)> {
     let mut out = Vec::new();
     if probe.small_ram() {
         out.extend([
@@ -271,7 +280,9 @@ fn defaults(probe: &Probe, console: Profile) -> Vec<(&'static str, &'static str,
             "no book of who had what memory of the card: it decodes AMD's descriptors only, \
              says nothing on this card and costs memory (victory-gpu book.rs)",
         ));
-        if console == Profile::SeriesS {
+        // Only with the Series S the preset chose: one asked for by name
+        // (`--console series-s`) keeps its own upscaler, as before.
+        if chosen && console == Profile::SeriesS {
             out.push((
                 "VICTORY_UPSCALER",
                 "6",
@@ -325,9 +336,18 @@ fn tiles([w, h]: [u32; 2]) -> u64 {
     u64::from(w.div_ceil(8)) * u64::from(h.div_ceil(4))
 }
 
+/// `VICTORY_INDIRECT_WIDE=1`, read as `victory-gpu` `indirect.rs` reads it
+/// (`wide_limit`: `1` exactly): indirect dispatches of up to 2^20 groups in
+/// x on any card, so that none of the title's tile lists is cut and the
+/// render size is not warned of (the runtime says once what it does).
+fn wide(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env("VICTORY_INDIRECT_WIDE").as_deref() == Some("1")
+}
+
 /// The warnings, which refuse nothing: on a PC with little RAM a commit
 /// limit under the RAM and [`COMMIT_ABOVE_RAM`], and on a card other than
-/// AMD's a render size of more tiles than [`MOST_GROUPS`].
+/// AMD's a render size of more tiles than [`MOST_GROUPS`] (not with
+/// [`wide`]).
 fn warnings(
     probe: &Probe,
     console: Profile,
@@ -351,7 +371,7 @@ fn warnings(
             gib(m.total + COMMIT_ABOVE_RAM),
         ));
     }
-    if probe.not_amd() {
+    if probe.not_amd() && !wide(env) {
         let size = render_size(console, fsr_input, env);
         let tiles = tiles(size);
         if tiles > MOST_GROUPS {
@@ -816,6 +836,29 @@ mod tests {
         let d = decide(&small_pc(), &x, &none);
         assert_eq!(d.console, Profile::SeriesX);
         assert!(!names(&d).contains(&"VICTORY_UPSCALER"));
+        // Series S asked for by name keeps its own upscaler; the PC's
+        // defaults still come.
+        let s = Asked {
+            console: Console::SeriesS,
+            fsr_input: None,
+        };
+        let d = decide(&small_pc(), &s, &none);
+        assert_eq!(d.console, Profile::SeriesS);
+        assert!(d.console_why.is_none());
+        assert_eq!(
+            names(&d),
+            [
+                "VICTORY_RESIDENCY",
+                "VICTORY_BURY_LAG",
+                "VICTORY_WINDOW_KB",
+                "VICTORY_WINDOW_TAILS",
+                "VICTORY_LEVELS_ON_DEMAND",
+                "VICTORY_BOOK",
+            ]
+        );
+        // FidelityFX at 2/3 renders 1280x720: the commit limit alone is said.
+        assert_eq!(d.warnings.len(), 1, "{:?}", d.warnings);
+        assert!(d.warnings[0].contains("32768 MB"));
     }
 
     #[test]
@@ -995,21 +1038,30 @@ mod tests {
             console: Console::SeriesX,
             fsr_input: None,
         };
-        let warned = |output: Option<&'static str>| {
+        let warned_with = |output: Option<&'static str>, wide: Option<&'static str>| {
             let env = move |name: &str| {
-                (name == "VICTORY_OUTPUT")
-                    .then_some(output)
-                    .flatten()
-                    .map(str::to_owned)
+                match name {
+                    "VICTORY_OUTPUT" => output,
+                    "VICTORY_INDIRECT_WIDE" => wide,
+                    _ => None,
+                }
+                .map(str::to_owned)
             };
             decide(&small_pc(), &x, &env)
                 .warnings
                 .iter()
                 .any(|w| w.contains("tile"))
         };
+        let warned = |output| warned_with(output, None);
         assert!(warned(None));
         assert!(!warned(Some("2560x1440")));
         assert!(!warned(Some("1920x1080")));
+        // VICTORY_INDIRECT_WIDE=1 runs them whole; any other value as unset,
+        // as indirect.rs reads it.
+        assert!(!warned_with(None, Some("1")));
+        for other in ["0", " 1", "2", ""] {
+            assert!(warned_with(None, Some(other)), "{other:?}");
+        }
         // On the dev box's AMD card none.
         assert!(decide(&dev_box(), &x, &none).warnings.is_empty());
     }
