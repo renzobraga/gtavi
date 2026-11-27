@@ -1509,6 +1509,31 @@ fn wide_threads() -> usize {
     std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
 }
 
+/// Whether the threads kept for [`wide`] run above normal priority, as the
+/// submitting thread does (`VICTORY_WIDE_ABOVE=1`; `0`: at normal priority,
+/// as before; unset: on a small processor, `crate::cores::small_cpu`).
+///
+/// The submitting thread hands them its refreshes, compares and copies and
+/// waits for the last of them to be done. At normal priority they share
+/// the processors with every other thread at it (the title's, those that
+/// translate lists, streaming's); with 24 logical processors one was
+/// mostly free, with 12 the thread above them waits for whichever is
+/// last to get one. They sleep between such work, so they take nothing
+/// from the others but while they are waited for.
+fn wide_above() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| wide_above_wanted(std::env::var("VICTORY_WIDE_ABOVE").ok().as_deref(), crate::cores::small_cpu()))
+}
+
+/// [`wide_above`]: as asked, else on a small processor.
+fn wide_above_wanted(asked: Option<&str>, small: bool) -> bool {
+    match asked.map(str::trim) {
+        Some("1") => true,
+        Some("0") => false,
+        _ => small,
+    }
+}
+
 fn workers() -> &'static Workers {
     static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -1521,6 +1546,11 @@ fn workers() -> &'static Workers {
         for i in 0..wide_threads() {
             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
                 crate::cores::keep_helper_on_fast_cores("victory-wide");
+                if wide_above() {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+                    // SAFETY: this thread's own priority.
+                    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
+                }
                 let workers = WORKERS.get().expect("made above");
                 loop {
                     let job = {
@@ -1809,9 +1839,26 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide, wide_above_wanted};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The threads kept for `wide` go above normal on a small processor
+    /// alone, unless the switch says otherwise.
+    #[test]
+    fn wide_threads_go_above_normal_on_a_small_processor() {
+        // Unset: the i9-12900K's at normal priority, as before; a Ryzen 5
+        // 7600X's above it.
+        assert!(!wide_above_wanted(None, false));
+        assert!(wide_above_wanted(None, true));
+        // Asked for: that, either way.
+        assert!(wide_above_wanted(Some("1"), false));
+        assert!(wide_above_wanted(Some(" 1 "), false));
+        assert!(!wide_above_wanted(Some("0"), true));
+        // Anything else: as unset.
+        assert!(wide_above_wanted(Some("x"), true));
+        assert!(!wide_above_wanted(Some("x"), false));
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
@@ -2021,8 +2068,19 @@ impl Drop for Compared {
 
 /// The runs of bytes where `now` differs from `was` (of one length), as
 /// (offset, bytes) in order: every differing byte is in a run and no equal
-/// byte is.
+/// byte is. With AVX-512 ([`crate::cores::avx512`]) 64 bytes to a compare
+/// ([`changed_runs_avx512`]), else as [`changed_runs_plain`].
 fn changed_runs(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    #[cfg(target_arch = "x86_64")]
+    if crate::cores::avx512() {
+        // SAFETY: the processor has AVX-512 (F and BW).
+        return unsafe { changed_runs_avx512(now, was) };
+    }
+    changed_runs_plain(now, was)
+}
+
+/// [`changed_runs`], a byte (eight while they are equal) at a time.
+fn changed_runs_plain(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     let n = now.len().min(was.len());
     let mut runs = Vec::new();
     let mut i = 0;
@@ -2158,9 +2216,15 @@ fn dword_runs(at: usize, title: &[u8], merged: &[u8], gap: usize) -> Vec<(usize,
 /// 12 MB this way and finds 80,000 runs.
 fn word_runs(at: usize, title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: the processor has AVX2, and the lengths are the same.
-        return unsafe { word_runs_avx2(title, held) };
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() {
+        if crate::cores::avx512() {
+            // SAFETY: the processor has AVX-512, and the lengths are the same.
+            return unsafe { word_runs_avx512(title, held) };
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the processor has AVX2, and the lengths are the same.
+            return unsafe { word_runs_avx2(title, held) };
+        }
     }
     dword_runs(at, title, held, 0)
 }
@@ -2226,9 +2290,15 @@ fn under_fused() -> bool {
 /// `held` is `title` afterwards.
 fn word_runs_put(at: usize, title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
     #[cfg(target_arch = "x86_64")]
-    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() && std::arch::is_x86_feature_detected!("avx2") {
-        // SAFETY: the processor has AVX2, and the lengths are the same.
-        return unsafe { word_runs_put_avx2(title, held) };
+    if at.is_multiple_of(4) && title.len().is_multiple_of(4) && title.len() == held.len() {
+        if crate::cores::avx512() {
+            // SAFETY: the processor has AVX-512, and the lengths are the same.
+            return unsafe { word_runs_put_avx512(title, held) };
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            // SAFETY: the processor has AVX2, and the lengths are the same.
+            return unsafe { word_runs_put_avx2(title, held) };
+        }
     }
     let runs = dword_runs(at, title, held, 0);
     for &(r, m) in &runs {
@@ -2282,6 +2352,178 @@ unsafe fn word_runs_put_avx2(title: &[u8], held: &mut [u8]) -> Vec<(usize, usize
             push(i, 4);
         }
         i += 4;
+    }
+    runs
+}
+
+/// Adds the runs of set bits of `mask` to `runs`, bit `b` standing for the
+/// `unit` bytes from `base + unit * b`: a run that goes on from the last one
+/// makes that one longer.
+#[cfg(target_arch = "x86_64")]
+fn push_runs(runs: &mut Vec<(usize, usize)>, base: usize, unit: usize, mut mask: u64) {
+    while mask != 0 {
+        let first = mask.trailing_zeros();
+        let count = (mask >> first).trailing_ones();
+        let (from, len) = (base + unit * first as usize, unit * count as usize);
+        match runs.last_mut() {
+            Some((a, n)) if *a + *n == from => *n += len,
+            _ => runs.push((from, len)),
+        }
+        if first + count >= 64 {
+            break;
+        }
+        mask &= u64::MAX << (first + count);
+    }
+}
+
+/// The dwords of the 256 bytes from `i` on (of `n`) in which `a` and `b`
+/// differ, a bit each, none past `n`; with `put`, those of `b` take `a`'s.
+/// For what is left behind the last whole 256 bytes.
+///
+/// # Safety
+/// AVX-512 F; `a` and `b` hold `n` bytes, a multiple of 4, and `i < n`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn words_differ_avx512(a: *const u8, b: *mut u8, i: usize, n: usize, put: bool) -> u64 {
+    use std::arch::x86_64::*;
+    let mut differ = 0u64;
+    for k in 0..4 {
+        let from = i + 64 * k;
+        if from >= n {
+            break;
+        }
+        let words = (n - from) / 4;
+        let lanes: __mmask16 = if words >= 16 { u16::MAX } else { (1u16 << words) - 1 };
+        // SAFETY: the words inside both; masked loads and stores touch no
+        // byte of the lanes left out.
+        unsafe {
+            let now = _mm512_maskz_loadu_epi32(lanes, a.add(from).cast());
+            let old = _mm512_maskz_loadu_epi32(lanes, b.add(from).cast_const().cast());
+            let m = _mm512_mask_cmpneq_epi32_mask(lanes, now, old);
+            if put && m != 0 {
+                _mm512_mask_storeu_epi32(b.add(from).cast(), m, now);
+            }
+            differ |= u64::from(m) << (16 * k);
+        }
+    }
+    differ
+}
+
+/// [`word_runs_avx2`] with AVX-512: a compare of 64 bytes gives its mask of
+/// dwords at once, and what is left behind the last 256 bytes is looked at
+/// the same way (masked) rather than a word at a time. The same runs.
+///
+/// On an AVX-512 Xeon (the only one at hand), pages of 4 KiB: 1.2 to 1.7
+/// times as fast but for one with a quarter of its words changed (1.05).
+///
+/// # Safety
+/// AVX-512 F, and two slices of one length, whole words.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn word_runs_avx512(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let (a, b) = (title.as_ptr(), held.as_ptr());
+    let n = title.len();
+    let mut i = 0;
+    while i + 256 <= n {
+        let mut differ = 0u64;
+        for k in 0..4 {
+            // SAFETY: inside both slices (`i + 256 <= n`).
+            let m = unsafe {
+                _mm512_cmpneq_epi32_mask(_mm512_loadu_si512(a.add(i + 64 * k).cast()), _mm512_loadu_si512(b.add(i + 64 * k).cast()))
+            };
+            differ |= u64::from(m) << (16 * k);
+        }
+        push_runs(&mut runs, i, 4, differ);
+        i += 256;
+    }
+    if i < n {
+        // SAFETY: the words left, inside both; nothing is put.
+        let differ = unsafe { words_differ_avx512(a, b.cast_mut(), i, n, false) };
+        push_runs(&mut runs, i, 4, differ);
+    }
+    runs
+}
+
+/// [`word_runs_put_avx2`] with AVX-512: every 64 bytes of `held` in which a
+/// word differs take `title`'s (behind the last 256, the words that differ).
+/// The same runs, and `held` is `title` afterwards.
+///
+/// # Safety
+/// AVX-512 F, and two slices of one length, whole words.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn word_runs_put_avx512(title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let (a, b) = (title.as_ptr(), held.as_mut_ptr());
+    let n = title.len();
+    let mut i = 0;
+    while i + 256 <= n {
+        let mut differ = 0u64;
+        for k in 0..4 {
+            let at = i + 64 * k;
+            // SAFETY: inside both slices (`i + 256 <= n`).
+            unsafe {
+                let now = _mm512_loadu_si512(a.add(at).cast());
+                let m = _mm512_cmpneq_epi32_mask(now, _mm512_loadu_si512(b.add(at).cast_const().cast()));
+                if m != 0 {
+                    _mm512_storeu_si512(b.add(at).cast(), now);
+                }
+                differ |= u64::from(m) << (16 * k);
+            }
+        }
+        push_runs(&mut runs, i, 4, differ);
+        i += 256;
+    }
+    if i < n {
+        // SAFETY: the words left, inside both.
+        let differ = unsafe { words_differ_avx512(a, b, i, n, true) };
+        push_runs(&mut runs, i, 4, differ);
+    }
+    runs
+}
+
+/// [`changed_runs_plain`] with AVX-512 (F and BW): 64 bytes to a compare,
+/// whose mask gives the runs; what is left behind the last 256 bytes is
+/// looked at the same way, masked. The same runs.
+///
+/// On an AVX-512 Xeon, pages of 4 KiB: about three times as fast with some
+/// twenty changed words or more, 1.15 to 1.4 times with none.
+///
+/// # Safety
+/// AVX-512 F and BW.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw")]
+unsafe fn changed_runs_avx512(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
+    use std::arch::x86_64::*;
+    let n = now.len().min(was.len());
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let (a, b) = (now.as_ptr(), was.as_ptr());
+    let mut i = 0;
+    while i + 256 <= n {
+        let mut m = [0u64; 4];
+        for (k, m) in m.iter_mut().enumerate() {
+            // SAFETY: inside both slices (`i + 256 <= n`).
+            *m = unsafe { _mm512_cmpneq_epi8_mask(_mm512_loadu_si512(a.add(i + 64 * k).cast()), _mm512_loadu_si512(b.add(i + 64 * k).cast())) };
+        }
+        if m[0] | m[1] | m[2] | m[3] != 0 {
+            for (k, &m) in m.iter().enumerate() {
+                push_runs(&mut runs, i + 64 * k, 1, m);
+            }
+        }
+        i += 256;
+    }
+    while i < n {
+        let left = n - i;
+        let lanes: __mmask64 = if left >= 64 { u64::MAX } else { (1u64 << left) - 1 };
+        // SAFETY: the bytes inside both; masked loads touch no other.
+        let m = unsafe {
+            _mm512_mask_cmpneq_epi8_mask(lanes, _mm512_maskz_loadu_epi8(lanes, a.add(i).cast()), _mm512_maskz_loadu_epi8(lanes, b.add(i).cast()))
+        };
+        push_runs(&mut runs, i, 1, m);
+        i += 64;
     }
     runs
 }
@@ -2624,6 +2866,93 @@ mod merge_tests {
             assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 < w[1].0), "{changes:?}");
         }
         assert!(changed_runs(&[], &[]).is_empty());
+    }
+
+    /// The AVX-512 kernels find the runs the others do, and put the same
+    /// bytes: every length to 300 and some longer, slices at every alignment,
+    /// changes none, sparse, in runs, at the ends, dense, everywhere. (Where
+    /// the processor has no AVX-512 there is nothing to compare.)
+    #[test]
+    fn the_avx512_runs_are_the_same_runs() {
+        use super::{changed_runs_avx512, changed_runs_plain, word_runs_avx2, word_runs_avx512, word_runs_put_avx2, word_runs_put_avx512};
+        if !(std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl"))
+        {
+            return;
+        }
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        /// `was`, changed as `round` says.
+        fn changed(was: &[u8], round: usize, next: &mut impl FnMut() -> u64) -> Vec<u8> {
+            let n = was.len();
+            let mut now = was.to_vec();
+            if n == 0 {
+                return now;
+            }
+            match round % 6 {
+                0 => {}
+                1 => {
+                    for _ in 0..=next() % 8 {
+                        now[next() as usize % n] ^= 0x5a;
+                    }
+                }
+                2 => {
+                    for _ in 0..=next() % 20 {
+                        let at = next() as usize % n;
+                        let len = [1, 3, 4, 5, 31, 32, 33, 63, 64, 65, 300][next() as usize % 11].min(n - at);
+                        now[at..at + len].iter_mut().for_each(|b| *b ^= 0x81);
+                    }
+                }
+                3 => {
+                    now[0] ^= 1;
+                    now[n - 1] ^= 1;
+                    let tail = n.saturating_sub(70);
+                    now[tail..].iter_mut().for_each(|b| *b = b.wrapping_add(3));
+                }
+                4 => now.iter_mut().for_each(|b| *b ^= (next() & 1) as u8),
+                _ => now.iter_mut().for_each(|b| *b = b.wrapping_add(1)),
+            }
+            now
+        }
+        for len in (0..=300).chain([511, 512, 513, 1020, 1024, 4092, 4096, 4100]) {
+            for off in [0usize, 1, 2, 3, 4, 31, 60] {
+                for round in 0..6 {
+                    let base: Vec<u8> = (0..len + 64).map(|_| next() as u8).collect();
+                    let was = &base[off..off + len];
+                    let mut buffer = vec![0u8; off + len];
+                    buffer[off..].copy_from_slice(&changed(was, round, &mut next));
+                    let now = &buffer[off..];
+                    // SAFETY: the processor has AVX-512 (asked above); the
+                    // slices are of one length.
+                    unsafe {
+                        let plain = changed_runs_plain(now, was);
+                        assert_eq!(changed_runs_avx512(now, was), plain, "{len} {off} {round}");
+                        let cut = len / 3;
+                        assert_eq!(changed_runs_avx512(&now[..cut], was), changed_runs_plain(&now[..cut], was), "{len} {off} {round}");
+                        if len % 4 != 0 {
+                            continue;
+                        }
+                        let words = word_runs_avx2(now, was);
+                        assert_eq!(words, dword_runs(0x1000, now, was, 0), "{len} {off} {round}");
+                        assert_eq!(word_runs_avx512(now, was), words, "{len} {off} {round}");
+                        // The puts, into slices with bytes of their own around them.
+                        let mut around: Vec<u8> = (0..off + len + 8).map(|i| (i * 7) as u8).collect();
+                        around[off..off + len].copy_from_slice(was);
+                        let mut other = around.clone();
+                        assert_eq!(word_runs_put_avx2(now, &mut around[off..off + len]), words);
+                        assert_eq!(word_runs_put_avx512(now, &mut other[off..off + len]), words, "{len} {off} {round}");
+                        assert_eq!(other, around, "{len} {off} {round}");
+                        assert_eq!(&other[off..off + len], now);
+                    }
+                }
+            }
+        }
     }
 }
 

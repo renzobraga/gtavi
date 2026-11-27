@@ -2,6 +2,15 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
 use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, PAGE_READWRITE};
 
+#[test]
+fn a_small_processor_looks_at_the_records_on_three_threads() {
+    assert_eq!((view_threads(None, true, false), view_threads(None, false, false)), (6, 4));
+    assert_eq!((view_threads(None, true, true), view_threads(None, false, true)), (3, 4));
+    assert_eq!(view_threads(Some(6), true, true), 6);
+    assert_eq!(view_threads(Some(0), false, false), 1);
+    assert_eq!(view_threads(Some(40), true, false), 16);
+}
+
 struct Random(u64);
 
 impl Random {

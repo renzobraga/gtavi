@@ -383,7 +383,7 @@ impl CpuMeter {
                 return None;
             }
             let p = GetProcAddress(ntdll, c"NtQuerySystemInformation".as_ptr().cast())?;
-            Some(std::mem::transmute::<_, NtQuery>(p))
+            Some(std::mem::transmute::<unsafe extern "system" fn() -> isize, NtQuery>(p))
         });
         let Some(query) = query else { return };
         let n = std::thread::available_parallelism().map_or(8, |n| n.get()).min(64);

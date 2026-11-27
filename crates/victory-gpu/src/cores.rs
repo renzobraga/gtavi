@@ -1,6 +1,117 @@
 //! Which processors our own threads run on, where a processor has two kinds
 //! of cores. `cpu_sets` and `keep_on_fast_cores` are fxceless/victory-fork's
 //! (`framelog.rs`, commit 0b0074e0, GPL-3.0-or-later, as this).
+//!
+//! Also what our pools are sized by on a processor with few of them
+//! ([`small_cpu`], [`physical_cores`]), and whether our vector kernels use
+//! AVX-512 ([`avx512`]).
+
+/// Logical processors under which a processor counts as a small one: the
+/// threads of ours were counted for 24 (i9-12900K), and a six-core processor
+/// with two threads a core (Ryzen 5 7600X) has 12.
+const SMALL_CPU: usize = 16;
+
+/// Whether `logical` processors make a small one ([`SMALL_CPU`]).
+pub(crate) fn small_cpu_of(logical: usize) -> bool {
+    logical < SMALL_CPU
+}
+
+/// Whether this processor is a small one: fewer than 16 logical processors
+/// (`std::thread::available_parallelism`; not known: not small). Pools of
+/// ours that were sized for 24 are sized by the cores there are where it is,
+/// and some of our helpers run at another priority; each says so where it
+/// is sized. A `VICTORY_...` switch given for one of them wins.
+pub fn small_cpu() -> bool {
+    static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SMALL.get_or_init(|| {
+        let small = std::thread::available_parallelism().is_ok_and(|n| small_cpu_of(n.get()));
+        if small {
+            tracing::info!(
+                logical = std::thread::available_parallelism().map_or(0, |n| n.get()),
+                cores = physical_cores(),
+                "a small processor: our pools are sized by its cores"
+            );
+        }
+        small
+    })
+}
+
+/// The cores of group 0 (each once, however many logical processors it
+/// runs: two on most desktop processors), once; where they cannot be told,
+/// half the logical processors.
+pub fn physical_cores() -> usize {
+    static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CORES.get_or_init(|| match cores_of_group_0() {
+        0 => (std::thread::available_parallelism().map_or(2, |n| n.get()) / 2).max(1),
+        n => n,
+    })
+}
+
+/// The system's core records of group 0, counted (none known: 0).
+fn cores_of_group_0() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{
+        GetLogicalProcessorInformationEx, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
+    };
+    let mut bytes = 0u32;
+    // SAFETY: a size query, then the call into a buffer of that size.
+    unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, std::ptr::null_mut(), &mut bytes) };
+    // A core's record (48 bytes) is shorter than the structure, which is as
+    // long as the longest kind (80): room for one past the last record, so
+    // that the last is read whole and counted.
+    let room = (bytes as usize + size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()).div_ceil(8);
+    let mut buffer = vec![0u64; room];
+    // SAFETY: as above; the buffer holds `bytes` bytes and more, aligned for
+    // the records.
+    let ok = unsafe { GetLogicalProcessorInformationEx(RelationProcessorCore, buffer.as_mut_ptr().cast(), &mut bytes) };
+    let mut cores = 0;
+    let mut at = 0usize;
+    // (A record's kind and size are its first eight bytes.)
+    while ok != 0 && at + 8 <= bytes as usize {
+        // SAFETY: a record inside the buffer, which has room for the
+        // structure past its start; each says its own size.
+        let info = unsafe { &*(buffer.as_ptr().cast::<u8>().add(at).cast::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>()) };
+        if info.Size == 0 {
+            break;
+        }
+        // SAFETY: a core's record (the kind asked for), with its first
+        // group mask.
+        if info.Relationship == RelationProcessorCore && unsafe { info.Anonymous.Processor.GroupMask[0].Group } == 0 {
+            cores += 1;
+        }
+        at += info.Size as usize;
+    }
+    cores
+}
+
+/// Whether our own vector kernels use AVX-512 (F, BW and VL) where the
+/// processor has it (`VICTORY_SIMD=avx2`: the AVX2 ones, as on a processor
+/// without it, for an A/B; on by default where it is there). The stores of
+/// title memory that leave dwords beside them alone
+/// (`crate::safecopy::put_changed`, `crate::safecopy::merge`) were
+/// `vpmaskmovd`, which AMD's Zen cores run as a long string of micro-ops,
+/// against one store under a mask register; the compares of
+/// `crate::shadow` take 64 bytes at a time and give their masks directly.
+/// The i9-12900K has no AVX-512: nothing changes there. (On an Intel
+/// processor whose cores slow down for 512-bit work, `VICTORY_SIMD=avx2` is
+/// the thing to try.)
+pub(crate) fn avx512() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let there = std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vl");
+        let on = avx512_wanted(std::env::var("VICTORY_SIMD").ok().as_deref(), there);
+        if there {
+            tracing::info!(on, "our vector kernels: AVX-512 where the processor has it (VICTORY_SIMD=avx2: AVX2)");
+        }
+        on
+    })
+}
+
+/// [`avx512`]: as asked (`VICTORY_SIMD`), where the processor has it.
+fn avx512_wanted(asked: Option<&str>, there: bool) -> bool {
+    there && !asked.is_some_and(|v| v.trim().eq_ignore_ascii_case("avx2"))
+}
 
 /// The system's processor sets of group 0: each one's id, its efficiency
 /// class (higher is faster) and its core (which two of them may share).
@@ -173,6 +284,21 @@ fn lane_core() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_LANE_CORE").is_some_and(|v| v == "1"))
 }
 
+/// Whether [`lane_core`] is asked for at all (`VICTORY_LANE_CORE=1`, or the
+/// switch turned on and off while the title runs). Where all cores are of
+/// one kind (a Ryzen 5 7600X's six) no thread of ours asks for processors,
+/// so the submitting thread was never told of its core and the switch did
+/// nothing: there the submitting thread asks then, and no other. A core of
+/// six kept for one thread is a sixth of the processor: it stays a thing to
+/// try, off by default.
+fn lane_core_asked() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("VICTORY_LANE_CORE").is_some() {
+        return true;
+    }
+    lane_core()
+}
+
 /// Threads that asked: a handle of each, and whether it is the submitting one.
 static ASKED: std::sync::Mutex<Vec<(usize, bool)>> = std::sync::Mutex::new(Vec::new());
 
@@ -202,8 +328,11 @@ pub(crate) fn settle() {
             Some((own, _)) if lane => own,
             _ => &helpers,
         };
+        // (None: what it was told is taken back. Only where all cores are
+        // alike, the submitting thread's when its core is not kept.)
+        let at = if sets.is_empty() { null } else { sets.as_ptr() };
         // SAFETY: a handle kept open, and the system's own set ids.
-        unsafe { SetThreadSelectedCpuSets(thread as _, sets.as_ptr(), sets.len() as u32) };
+        unsafe { SetThreadSelectedCpuSets(thread as _, at, sets.len() as u32) };
     }
     tracing::info!(on = one.is_some(), core = ?one.as_ref().map(|o| &o.0), "the submitting thread has a core of its own (VICTORY_LANE_CORE)");
     tracing::info!(
@@ -260,8 +389,9 @@ fn ask(what: &str, from: u32) {
         // change while the title runs, and `settle` follows it)
         (fast_sets(&sets, false), sets.len())
     });
-    // All alike (or nothing known): nothing to ask for.
-    if fast.is_empty() {
+    // All alike (or nothing known): nothing to ask for, but for the
+    // submitting thread's own core where it is asked for.
+    if fast.is_empty() && !(what == "victory-submit" && lane_core_asked()) {
         return;
     }
     // SAFETY: our own thread; the handle stays open.
@@ -320,6 +450,40 @@ mod tests {
         // A larger cache of under eight sets: nothing.
         let few: Vec<(u32, u32)> = (0..32).map(|i| (256 + i, if i < 4 { 64 * MB } else { 32 * MB })).collect();
         assert!(fast_by_cache(&sets, &few).is_empty());
+    }
+
+    #[test]
+    fn a_small_processor_is_one_of_fewer_than_sixteen_threads() {
+        // A Ryzen 5 7600X; an eight-core processor of two threads a core;
+        // the i9-12900K.
+        assert!(small_cpu_of(12));
+        assert!(!small_cpu_of(16));
+        assert!(!small_cpu_of(24));
+        let logical = std::thread::available_parallelism().map_or(1, |n| n.get());
+        assert!((1..=logical).contains(&physical_cores()));
+        assert_eq!(small_cpu(), small_cpu_of(logical));
+    }
+
+    #[test]
+    fn avx512_is_used_where_it_is_there_unless_avx2_is_asked_for() {
+        assert!(avx512_wanted(None, true));
+        assert!(avx512_wanted(Some("avx512"), true));
+        assert!(!avx512_wanted(Some("avx2"), true));
+        assert!(!avx512_wanted(Some(" AVX2 "), true));
+        assert!(!avx512_wanted(None, false));
+        assert!(!avx512_wanted(Some("avx512"), false));
+    }
+
+    #[test]
+    fn six_cores_alike_have_a_core_for_the_submitting_thread() {
+        // A Ryzen 5 7600X: twelve sets of one class, two to a core. No fast
+        // sets, but one core of the six and the five others.
+        let sets = alike(12);
+        assert!(fast_by_class(&sets).is_empty());
+        let (own, others) = one_core(&sets).unwrap();
+        assert_eq!((own, others.len()), (vec![266, 267], 10));
+        // Four cores: none.
+        assert!(one_core(&alike(8)).is_none());
     }
 
     #[test]

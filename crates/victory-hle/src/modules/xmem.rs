@@ -1062,23 +1062,47 @@ fn lean() -> bool {
 /// The title's streaming thread runs below normal priority, as do sixteen
 /// workers of ours when pipelines are made; on the console nothing else
 /// wants its core. Called where that thread maps and submits: lifts a
-/// thread that is below normal to above it (`VICTORY_STREAM_PRIORITY=0`:
-/// left as the title set it).
+/// thread that is below normal to above it ([`lifted_from`] says from
+/// where; `VICTORY_STREAM_PRIORITY=0`: left as the title set it).
 pub(crate) fn lift_thread() {
     use windows_sys::Win32::System::Threading::{
         GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
     };
-    static ON: LazyLock<bool> =
-        LazyLock::new(|| std::env::var_os("VICTORY_STREAM_PRIORITY").is_none_or(|v| v != "0"));
-    if !*ON {
+    static FROM: LazyLock<Option<i32>> = LazyLock::new(|| {
+        lifted_from(std::env::var("VICTORY_STREAM_PRIORITY").ok().as_deref(), victory_gpu::small_cpu())
+    });
+    let Some(from) = *FROM else {
         return;
-    }
+    };
     // SAFETY: plain calls on this thread.
     unsafe {
         let thread = GetCurrentThread();
-        if matches!(GetThreadPriority(thread), -2..0) {
+        if (from..0).contains(&GetThreadPriority(thread)) {
             SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
         }
+    }
+}
+
+/// The lowest priority [`lift_thread`] lifts (`VICTORY_STREAM_PRIORITY`):
+/// `0`, none; `2`, idle and up; any other value, lowest and below normal
+/// (idle not), as before; nothing, the same but on a small processor
+/// (`victory_gpu::small_cpu`: under 16 logical ones), where idle too.
+///
+/// The title sets the streaming thread to idle. Unless the title's
+/// priorities are left as it sets them (`crate::modules::kernel`'s
+/// `VICTORY_TITLE_PRIORITIES`) that is below normal by the time it maps,
+/// and lifted here; with them left so (the launcher's `0`) it stayed idle,
+/// below every busy thread, which on 12 logical processors is all of them
+/// at times.
+fn lifted_from(asked: Option<&str>, small: bool) -> Option<i32> {
+    const IDLE: i32 = -15;
+    const LOWEST: i32 = -2;
+    match asked.map(str::trim) {
+        Some("0") => None,
+        Some("2") => Some(IDLE),
+        Some(_) => Some(LOWEST),
+        None if small => Some(IDLE),
+        None => Some(LOWEST),
     }
 }
 
@@ -2019,6 +2043,18 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_streaming_thread_is_lifted_from_idle_on_a_small_processor() {
+        // The i9-12900K: lowest and below normal, as before.
+        assert_eq!(lifted_from(None, false), Some(-2));
+        // A Ryzen 5 7600X: idle too.
+        assert_eq!(lifted_from(None, true), Some(-15));
+        // Asked for: that, on either.
+        assert_eq!(lifted_from(Some("0"), true), None);
+        assert_eq!(lifted_from(Some("1"), true), Some(-2));
+        assert_eq!(lifted_from(Some("2"), false), Some(-15));
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
