@@ -2195,9 +2195,10 @@ fn spare_chunks_most() -> u64 {
 }
 
 /// Lets go of the scratch chunks kept idle, when the system is short of
-/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]; once as
-/// the memory the card shares reaches 85 % of its budget,
-/// [`crate::residency::shared_band`]).
+/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]: each
+/// second of it, but on a PC short of memory, [`crate::residency::short_of_ram`],
+/// once as it begins; and once as the memory the card shares reaches 85 % of
+/// its budget, [`crate::residency::shared_band`]).
 fn trim_spare_chunks() {
     trim_chunks(SPARE.lock().unwrap_or_else(|e| e.into_inner()));
 }

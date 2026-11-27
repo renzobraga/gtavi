@@ -4,7 +4,10 @@
 //! values of the last). Only with `VICTORY_RESIDENCY=1` ([`on`]): the memory
 //! of the system is then asked once a second; below 3 GiB of free RAM or 4 GiB
 //! of commit (out again above 5 / 6) texture prefetch is limited to 64 MiB a
-//! frame and idle scratch and staging blocks are let go; below 1.5 GiB of
+//! frame and idle scratch and staging blocks are let go (on a PC short of
+//! memory, [`short_of_ram`], where that lasts the whole run, the scratch
+//! chunks once as it begins and the card's empty texture blocks kept by the
+//! card's room: `crate::host`'s sweep, `crate::pool::room`); below 1.5 GiB of
 //! commit to 16 MiB; the texture pass stops below 512 MiB of commit, new
 //! staging blocks for textures picked by index below 1 GiB. With 32 GiB of RAM
 //! or less (or `VICTORY_RESIDENCY_LIMITED=1`) the budgets of a smaller PC.

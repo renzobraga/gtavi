@@ -77,9 +77,13 @@ target\diag\victory.exe warm --used                               # pipelines da
 
 - `warm --used` só tem efeito a partir da segunda execução. Rode-o de novo
   depois de atualizar o driver ou este branch.
-- No fim, `victory shaders` lista os programas de *compute* que uma placa de
-  ondas de 32 (NVIDIA) recusa ou pode recusar, com o hash de cada um. **Guarde
-  essa lista**, ela é a primeira coisa a mandar (veja o item 7).
+- Enquanto traduz, `victory shaders` avisa de cada programa de *compute* que
+  uma placa de ondas de 32 (NVIDIA) recusa ou pode recusar, com o hash dele
+  (linhas com `32-lane waves`). A linha final só dá as contagens. Só a primeira
+  tradução de cada programa gera esse aviso: uma execução que acha a tradução
+  já guardada não o repete. **Guarde a saída inteira da primeira execução**
+  (`... *>&1 | Tee-Object shaders.log`), porque ela é a primeira coisa a
+  mandar (veja o item 7).
 
 ## 4. Jogar
 
@@ -106,7 +110,7 @@ warning        ... (só se faltar commit ou se a resolução de render passar do
 
 | O quê | Escolha | Por quê |
 |---|---|---|
-| Perfil do console (`--console auto`) | **Series S** | Com 24 GB ou menos de RAM, ou uma placa de 10 GB ou menos, o perfil Series X (≈10,8 GB de memória do título, saída 4K) não cabe |
+| Perfil do console (`--console auto`) | **Series S** | Com 24 GB ou menos de RAM, ou uma placa de 10 GB ou menos, o perfil Series X (13,5 GiB de memória de console para o título, saída 4K; o Series S dá 7,6 GiB) não cabe |
 | Upscaler | `VICTORY_UPSCALER=6`: o upscaler do próprio título, 1280×720 → 1920×1080 | Os shaders de FidelityFX de console do Series S só rodaram em AMD até hoje. Só vale quando o perfil foi escolhido no automático |
 | Memória do PC | `VICTORY_RESIDENCY=1`, `VICTORY_BURY_LAG=64`, `VICTORY_WINDOW_KB=1024`, `VICTORY_WINDOW_TAILS=1` | Orçamentos de memória ligados, janelas de memória menores, sem liberar objetos cedo demais |
 | Memória da placa | `VICTORY_LEVELS_ON_DEMAND=1` | Níveis de mip das texturas ocupam VRAM só quando usados (2 a 3 GB a menos esperados) |
@@ -175,12 +179,19 @@ scripts\play.ps1 -Exe "..." -Console series-s -More @{
     VICTORY_HOST_PRESET='0'; VICTORY_SMALL_RAM='0'; VICTORY_SHARED_BAND='0'; VICTORY_VRAM_MB='0'
     VICTORY_LIST_RENEW='0'; VICTORY_SIMD='avx2'; VICTORY_DSTORAGE_DECODES='12'; VICTORY_RECORDS_THREADS='6'
     VICTORY_THIN_THREADS='8'; VICTORY_PIPELINE_WORKERS='8'; VICTORY_WIDE_ABOVE='0'; VICTORY_STREAM_PRIORITY='1'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB='3072'
 }
 ```
 
-Continuam ligadas só as regras de placa pequena: o piso de texturas, o espaço
-para *render targets* e os blocos vazios de textura. Elas valem para qualquer
-orçamento de 12 GB ou menos e não têm interruptor.
+Algumas diferenças continuam, e nenhuma delas tem interruptor:
+
+- O piso de texturas e a quantidade de blocos vazios de textura de uma placa
+  pequena (orçamento de 12 GB ou menos).
+- A segunda tentativa depois de um `E_OUTOFMEMORY`. Antes, a execução terminava
+  ali.
+- O perfil. Antes, o launcher usava Series X por padrão, com render interno de
+  2560×1440. A receita usa Series S de propósito, porque o Series X não cabe em
+  8 GB.
 
 ## 6. O que não dá nesta placa
 
