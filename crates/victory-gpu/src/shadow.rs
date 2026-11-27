@@ -1839,9 +1839,26 @@ pub(crate) fn back_line(frames: f64) {
 
 #[cfg(test)]
 mod wide_tests {
-    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide};
+    use super::{Job, PIECE, WIDE_JOB, copy_jobs, find_pieces, wide, wide_above_wanted};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The threads kept for `wide` go above normal on a small processor
+    /// alone, unless the switch says otherwise.
+    #[test]
+    fn wide_threads_go_above_normal_on_a_small_processor() {
+        // Unset: the i9-12900K's at normal priority, as before; a Ryzen 5
+        // 7600X's above it.
+        assert!(!wide_above_wanted(None, false));
+        assert!(wide_above_wanted(None, true));
+        // Asked for: that, either way.
+        assert!(wide_above_wanted(Some("1"), false));
+        assert!(wide_above_wanted(Some(" 1 "), false));
+        assert!(!wide_above_wanted(Some("0"), true));
+        // Anything else: as unset.
+        assert!(wide_above_wanted(Some("x"), true));
+        assert!(!wide_above_wanted(Some("x"), false));
+    }
 
     /// Every job runs once, however many there are, and `wide` returns
     /// only when all have.
@@ -2367,7 +2384,6 @@ fn push_runs(runs: &mut Vec<(usize, usize)>, base: usize, unit: usize, mut mask:
 /// AVX-512 F; `a` and `b` hold `n` bytes, a multiple of 4, and `i < n`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(clippy::incompatible_msrv)] // (AVX-512 is Rust 1.89's; the toolchain is pinned to 1.98)
 unsafe fn words_differ_avx512(a: *const u8, b: *mut u8, i: usize, n: usize, put: bool) -> u64 {
     use std::arch::x86_64::*;
     let mut differ = 0u64;
@@ -2404,7 +2420,6 @@ unsafe fn words_differ_avx512(a: *const u8, b: *mut u8, i: usize, n: usize, put:
 /// AVX-512 F, and two slices of one length, whole words.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(clippy::incompatible_msrv)] // (as above)
 unsafe fn word_runs_avx512(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
     use std::arch::x86_64::*;
     let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -2439,7 +2454,6 @@ unsafe fn word_runs_avx512(title: &[u8], held: &[u8]) -> Vec<(usize, usize)> {
 /// AVX-512 F, and two slices of one length, whole words.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(clippy::incompatible_msrv)] // (as above)
 unsafe fn word_runs_put_avx512(title: &[u8], held: &mut [u8]) -> Vec<(usize, usize)> {
     use std::arch::x86_64::*;
     let mut runs: Vec<(usize, usize)> = Vec::new();
@@ -2482,7 +2496,6 @@ unsafe fn word_runs_put_avx512(title: &[u8], held: &mut [u8]) -> Vec<(usize, usi
 /// AVX-512 F and BW.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-#[allow(clippy::incompatible_msrv)] // (as above)
 unsafe fn changed_runs_avx512(now: &[u8], was: &[u8]) -> Vec<(usize, usize)> {
     use std::arch::x86_64::*;
     let n = now.len().min(was.len());
