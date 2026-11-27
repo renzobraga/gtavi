@@ -118,9 +118,46 @@ unsafe impl Send for Memory {}
 /// What submissions that have run gave back.
 static SPARE: Mutex<Vec<Memory>> = Mutex::new(Vec::new());
 
-/// At most this much is kept (of the card's memory, with [`on_card`]).
+/// At most this much is kept (of the card's memory, with [`on_card`]):
+/// 128 MiB of the PC's while the memory it shares with the card is at 85 %
+/// of its budget (`crate::residency::shared_high`).
 fn kept() -> u64 {
-    if on_card() { 256 << 20 } else { 768 << 20 }
+    kept_for(on_card(), crate::residency::shared_high())
+}
+
+fn kept_for(on_card: bool, high: bool) -> u64 {
+    if on_card {
+        256 << 20
+    } else if high {
+        128 << 20
+    } else {
+        768 << 20
+    }
+}
+
+/// Lets go of what is kept past [`kept`], the largest first, as
+/// [`give_back`] does (the sweep, once a second).
+pub(super) fn trim() {
+    let gone: Vec<Memory> = {
+        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        spare.sort_by_key(|m| std::cmp::Reverse(m.size));
+        let mut gone = Vec::new();
+        while spare.iter().map(|m| m.size).sum::<u64>() > kept() {
+            gone.push(spare.remove(0));
+        }
+        gone
+    };
+    drop(gone);
+}
+
+/// Lets go of all that is kept, if the lock is free
+/// (`emergency_release`): the bytes that went.
+pub(super) fn release() -> u64 {
+    let gone: Vec<Memory> = match tried(&SPARE) {
+        Some(mut spare) => std::mem::take(&mut *spare),
+        None => return 0,
+    };
+    gone.iter().map(|m| m.size).sum()
 }
 
 /// Whether the memory lies in the card's memory, written by the CPU through
@@ -335,5 +372,19 @@ impl Own {
     /// The memory, to be kept until the submission has run.
     pub(super) fn memory(self) -> Memory {
         self.memory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::kept_for;
+
+    #[test]
+    fn sends_keep_128_mib_while_the_shared_memory_is_high() {
+        assert_eq!(kept_for(false, false), 768 << 20);
+        assert_eq!(kept_for(false, true), 128 << 20);
+        // The card's own memory is not the PC's.
+        assert_eq!(kept_for(true, true), 256 << 20);
+        assert_eq!(kept_for(true, false), 256 << 20);
     }
 }

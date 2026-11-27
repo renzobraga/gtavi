@@ -1310,18 +1310,48 @@ fn snapshots_kept() -> usize {
     *MOST.get_or_init(|| std::env::var("VICTORY_SNAPSHOT_POOL").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1024))
 }
 
+/// The bytes of snapshot buffers kept ([`give_back`]): 512 MiB, on a PC of
+/// 24 GiB or less (`crate::residency::small_ram_host`) 128 MiB. The largest
+/// buffer is kept whatever its size (the big heap's, 174 MB).
+pub(crate) fn snapshots_bytes_kept() -> usize {
+    snapshot_bytes_for(crate::residency::small_ram_host())
+}
+
+fn snapshot_bytes_for(small: bool) -> usize {
+    if small { 128 << 20 } else { 512 << 20 }
+}
+
+#[cfg(test)]
+mod snapshot_pool_tests {
+    #[test]
+    fn a_small_ram_host_keeps_a_quarter_of_the_snapshot_buffers() {
+        assert_eq!(super::snapshot_bytes_for(false), 512 << 20);
+        assert_eq!(super::snapshot_bytes_for(true), 128 << 20);
+    }
+}
+
+/// Lets go of every snapshot buffer kept, if the pool's lock is free
+/// (`crate::host::emergency_release`): the bytes that went.
+pub(crate) fn release_snapshots() -> u64 {
+    let gone: Vec<Vec<u8>> = match crate::host::tried(&POOL) {
+        Some(mut pool) => std::mem::take(&mut *pool),
+        None => return 0,
+    };
+    gone.iter().map(|v| v.capacity() as u64).sum()
+}
+
 /// Returns a snapshot buffer to the pool: at most [`snapshots_kept`] kept,
-/// the largest, and of those the largest one and the next ones up to `KEPT`
-/// bytes in all.
+/// the largest, and of those the largest one and the next ones up to
+/// [`snapshots_bytes_kept`] bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    let most = snapshots_bytes_kept();
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
     let (mut kept, mut total) = (0, 0usize);
     for v in pool.iter().take(snapshots_kept()) {
         total = total.saturating_add(v.capacity());
-        if kept > 0 && total > KEPT {
+        if kept > 0 && total > most {
             break;
         }
         kept += 1;
@@ -2989,6 +3019,16 @@ fn window_victims(entries: &[(u64, u64, usize)], keep: u64) -> Vec<usize> {
 static WINDOW_BAND: std::sync::Mutex<crate::host::RamBand> =
     std::sync::Mutex::new(crate::host::RamBand::Calm);
 
+/// Set when the system refused memory (`crate::host::emergency_release`):
+/// the next [`let_go_idle`] takes windows idle for a second.
+static SOON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The next [`let_go_idle`] lets go of the windows idle for a second (and
+/// four frames), whatever the memory free says.
+pub(crate) fn let_go_soon() {
+    SOON.store(true, Ordering::Relaxed);
+}
+
 /// Lets go of the copies of windows outside buffers that nothing names any
 /// more. They were never freed, and the world's streaming keeps asking for
 /// new ones: 648 windows (2.8 GB) when the cutscene began, 974 (4.3 GB)
@@ -3007,6 +3047,9 @@ pub(crate) fn let_go_idle() {
     const IDLE_FRAMES: u64 = 4;
     let budget = window_budget();
     let mut idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
+    if SOON.swap(false, Ordering::Relaxed) {
+        idle_ms = idle_ms.min(1000);
+    }
     let mut keep = u64::MAX;
     if let Some(bytes) = budget
         && let Some((working, private, free, commit, total, limit)) = crate::host::ram_sample()

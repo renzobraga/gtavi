@@ -556,14 +556,60 @@ fn sweep() {
     #[cfg(feature = "diagnostics")]
     crate::book::check();
     crate::residency::refresh();
-    if crate::residency::pressured() {
+    let memory = host().and_then(|h| h.video_memory());
+    crate::residency::refresh_shared(memory);
+    say_plan(memory);
+    // (With the PC's memory the card shares at 85 % of its budget or more,
+    // `crate::residency::shared_band`: what is kept spare goes too, the
+    // sends' memory down to 128 MiB and the idle host lists to 256.)
+    let high = crate::residency::shared_high();
+    if crate::residency::pressured() || high {
         trim_spare_chunks();
     }
-    crate::pool::room(host().and_then(|h| h.video_memory()));
+    if high {
+        send::trim();
+        crate::list::trim_idle();
+    }
+    crate::pool::room(memory);
     crate::pipeline::trim_library();
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+}
+
+/// Says once, at the first sweep, what is kept by the PC's memory and the
+/// card's ([`crate::residency::small_ram_host`], [`effective_budget`],
+/// [`crate::residency::shared_band`]), with the numbers it was chosen by.
+fn say_plan(memory: Option<[u64; 4]>) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if SAID.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let mb = |bytes: u64| bytes >> 20;
+    let budget = memory.map(|[budget, ..]| budget);
+    let raw = host().and_then(|h| h.video_memory_groups()).map(|[own, _]| own[0]);
+    let small_ram = crate::residency::small_ram_host();
+    tracing::info!(
+        "memory: the PC has {} MB (a small RAM host, 24 GiB or less: {small_ram}; VICTORY_SMALL_RAM); the card's budget \
+         is {} MB, the layer works by {} MB (a small card, 12 GiB or less: {}; VICTORY_VRAM_MB); the PC's memory shared \
+         with the card is followed: {} (VICTORY_SHARED_BAND); kept: up to {} idle host lists (and their allocators made \
+         anew when they held eight times what they hold: {}), {} MB of scratch chunks, {} empty blocks of staging buffers, \
+         {} MB of snapshot buffers, up to {} empty blocks of textures; room kept for render targets up to {} MB; \
+         textures always made up to {} MB",
+        crate::residency::total_ram().map_or(0, mb),
+        raw.map_or(0, mb),
+        budget.map_or(0, mb),
+        budget.is_some_and(small_card),
+        crate::residency::shared_followed(budget),
+        crate::list::idle_most(),
+        crate::list::renewal_said(crate::residency::shared_followed(budget)),
+        mb(spare_chunks_most()),
+        if crate::residency::short_of_ram() { "1" } else { "up to 8" },
+        crate::shadow::snapshots_bytes_kept() >> 20,
+        crate::pool::texture_spares_most(budget),
+        mb(crate::resource::targets_room_most(budget)),
+        mb(crate::resource::texture_floor(budget)),
+    );
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -2096,8 +2142,7 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
         let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
         for (chunk, size) in chunks {
             let back = if scratch_pool() {
-                let limit = if keep_freed() && !crate::residency::limited_host_ram() { SPARE_KEPT } else { SPARE_MOST };
-                spare.give(chunk, size, limit)
+                spare.give(chunk, size, spare_chunks_most())
             } else {
                 Some(chunk)
             };
@@ -2118,17 +2163,36 @@ fn give_chunks(chunks: Vec<(Chunk, u64)>) {
     drop(freed);
 }
 
+/// The most bytes of scratch chunks kept while no list holds them:
+/// [`SPARE_KEPT`] with [`keep_freed`], [`SPARE_MOST`] with
+/// `VICTORY_RESIDENCY=1` on a PC of 32 GiB or less, and on a PC short of
+/// memory ([`crate::residency::short_of_ram`]: of 24 GiB or less, or the
+/// memory the card shares at 70 % of its budget), where 1 GiB of them is
+/// some 6 % of all there is.
+fn spare_chunks_most() -> u64 {
+    if keep_freed() && !crate::residency::limited_host_ram() && !crate::residency::short_of_ram() {
+        SPARE_KEPT
+    } else {
+        SPARE_MOST
+    }
+}
+
 /// Lets go of the scratch chunks kept idle, when the system is short of
-/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]).
+/// memory (`VICTORY_RESIDENCY=1`, [`crate::residency::pressured`]; the
+/// memory the card shares at 85 % of its budget,
+/// [`crate::residency::shared_high`]).
 fn trim_spare_chunks() {
-    let freed: Vec<(Chunk, u64)> = {
-        let mut spare = SPARE.lock().unwrap_or_else(|e| e.into_inner());
-        if spare.kept.is_empty() {
-            return;
-        }
-        spare.bytes = 0;
-        std::mem::take(&mut spare.kept)
-    };
+    trim_chunks(SPARE.lock().unwrap_or_else(|e| e.into_inner()));
+}
+
+/// [`trim_spare_chunks`] with the lock held; the chunks are freed without it.
+fn trim_chunks(mut spare: std::sync::MutexGuard<'_, Spare<Chunk>>) -> u64 {
+    if spare.kept.is_empty() {
+        return 0;
+    }
+    spare.bytes = 0;
+    let freed = std::mem::take(&mut spare.kept);
+    drop(spare);
     let count = freed.len() as u64;
     let bytes: u64 = freed.iter().map(|(_, s)| *s).sum();
     ALIVE[1].fetch_sub(count, Ordering::Relaxed);
@@ -2136,6 +2200,66 @@ fn trim_spare_chunks() {
     ALIVE[3].fetch_sub(count, Ordering::Relaxed);
     ALIVE[4].fetch_sub(bytes, Ordering::Relaxed);
     drop(freed);
+    bytes
+}
+
+/// `lock` if it is free now (a poisoned one too): what is let go in an
+/// emergency ([`emergency_release`]) may be held by the very caller.
+pub(crate) fn tried<T>(lock: &Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    match lock.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Lets go at once of what is kept spare for reuse, when the system refused
+/// memory (E_OUTOFMEMORY) where the run would otherwise end
+/// ([`or_after_release`]): the idle scratch chunks, the empty blocks of
+/// textures and of their staging buffers, the idle host lists, the memory
+/// kept for sends, the snapshot buffers kept; the windows of title memory
+/// idle for a second go at the next sweep (which runs before a submission,
+/// on the thread that submits). Every lock is only tried, as a caller may
+/// hold one, and nothing freed here is named by work on the card: all of it
+/// came back after its last submission ran. Said each time, with what went.
+pub(crate) fn emergency_release() {
+    let chunks = tried(&SPARE).map_or(0, trim_chunks);
+    let blocks = crate::pool::release_spares();
+    let lists = crate::list::release_idle();
+    let sends = send::release();
+    let snapshots = crate::shadow::release_snapshots();
+    crate::shadow::let_go_soon();
+    static TIMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = TIMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 32 || n.is_power_of_two() {
+        tracing::warn!(
+            times = n,
+            frame = crate::frame::current(),
+            "out of memory (E_OUTOFMEMORY): let go of {} MB of scratch chunks, {} empty blocks of textures and staging \
+             buffers, {lists} idle host lists, {} MB kept for sends and {} MB of snapshot buffers; idle windows of title \
+             memory go at the next sweep; asking once more",
+            chunks >> 20,
+            blocks,
+            sends >> 20,
+            snapshots >> 20
+        );
+    }
+}
+
+/// `make`, and if that fails for want of memory (E_OUTOFMEMORY, as this
+/// thread's last refusal says: [`crate::residency::refused`]) once more
+/// after [`emergency_release`]: for the places where a refusal ends the run
+/// ([`fail`]). Any other failure is not asked again.
+pub(crate) fn or_after_release<T>(mut make: impl FnMut() -> Option<T>) -> Option<T> {
+    let _ = crate::residency::take_out_of_memory();
+    if let Some(made) = make() {
+        return Some(made);
+    }
+    if !crate::residency::take_out_of_memory() {
+        return None;
+    }
+    emergency_release();
+    make()
 }
 
 /// What the host keeps for copies in the card's own memory
@@ -4247,6 +4371,7 @@ impl Host {
         match made {
             Ok(prelude) => Some(prelude),
             Err(e) => {
+                crate::residency::refused(&e);
                 tracing::warn!(error = %e, "no host list for a prelude");
                 None
             }
@@ -4498,7 +4623,9 @@ impl Host {
         let own = if send::own() { send::take(self, &dirty) } else { None };
         taking.end();
         if !dirty.is_empty() {
-            let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
+            // (Asked once more after a refusal for want of memory; the lock
+            // held here is none `emergency_release` takes.)
+            let Some(sync) = work.sync.pop().or_else(|| or_after_release(|| self.make_prelude())) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
             let _recording = crate::timeline::span("copies in the card's memory: the list");
@@ -4686,7 +4813,7 @@ impl Host {
         }
         work.taken = at;
         if plan.ranges.iter().any(|r| r.compared) {
-            let Some(check) = work.check.pop().or_else(|| self.make_prelude()) else {
+            let Some(check) = work.check.pop().or_else(|| or_after_release(|| self.make_prelude())) else {
                 fail(format_args!("no host list for the compare of host copies in the card's memory"));
             };
             let (allocator, list) = &check;
@@ -4802,7 +4929,8 @@ impl Host {
         };
         // SAFETY: plain objects of our own.
         unsafe {
-            let fence: ID3D12Fence = self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
+            let fence: ID3D12Fence =
+                self.device.CreateFence(0, D3D12_FENCE_FLAG_NONE).inspect_err(crate::residency::refused).ok()?;
             let event = CreateEventW(None, false, false, None).ok()?;
             Some(RelayFetch {
                 list,
@@ -4913,7 +5041,9 @@ impl Host {
         }
         land::spent(land::stat::GATHER, gathering);
         if fetch.is_none() {
-            *fetch = self.make_relay_fetch();
+            // (Asked once more after a refusal for want of memory: this
+            // thread holds no lock here.)
+            *fetch = or_after_release(|| self.make_relay_fetch());
         }
         // On the copy queue a later flight may be at a piece while it is
         // fetched: the pieces come down whole, to be hashed.
@@ -4944,7 +5074,7 @@ impl Host {
         };
         if f.buffer.as_ref().is_none_or(|b| b.2 < total) {
             let size = total.next_multiple_of(16 << 20);
-            f.buffer = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+            f.buffer = or_after_release(|| self.shared_buffer(size)).map(|(buffer, data)| (buffer, data as usize, size));
         }
         let Some((buffer, data, _)) = f.buffer.clone() else {
             fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes, VICTORY_RELAY=1)"));
@@ -5262,7 +5392,10 @@ impl Host {
         if !pieces.is_empty() {
             if work.fetched.as_ref().is_none_or(|f| f.2 < total) {
                 let size = total.next_multiple_of(16 << 20);
-                work.fetched = self.shared_buffer(size).map(|(buffer, data)| (buffer, data as usize, size));
+                // (Asked once more after a refusal for want of memory; the
+                // locks held here are none `emergency_release` takes.)
+                work.fetched =
+                    or_after_release(|| self.shared_buffer(size)).map(|(buffer, data)| (buffer, data as usize, size));
             }
             let Some((fetched, data, _)) = &work.fetched else {
                 fail(format_args!("no memory to fetch what shaders wrote to the card's memory ({total} bytes)"));
@@ -6549,6 +6682,14 @@ impl HostList {
         }
         // SAFETY: our list.
         if let Err(e) = unsafe { self.list.Close() } {
+            // (A list that did not close cannot be closed again: there is
+            // nothing to ask once more. The driver says E_OUTOFMEMORY when
+            // it had no memory for the commands, and the run ends with that.)
+            if e.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+                fail(format_args!(
+                    "a host command list did not close ({e}): out of memory for its commands (the PC's memory, or the card's)"
+                ));
+            }
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
@@ -6612,17 +6753,51 @@ impl HostList {
                 give_batch_buffers(buffers);
             }
         }
-        // SAFETY: the list is not executing.
-        let reset = unsafe {
-            self.allocator
-                .Reset()
-                .and_then(|()| self.list.Reset(&self.allocator, None))
+        self.list.reset_count();
+        let reset = || {
+            // SAFETY: the list is not executing.
+            unsafe {
+                self.allocator
+                    .Reset()
+                    .and_then(|()| self.list.Reset(&self.allocator, None))
+            }
         };
-        if let Err(e) = reset {
+        let mut done = reset();
+        // Once more after a refusal for want of memory (a list that did not
+        // reset stays closed, and may be reset again); this thread holds no
+        // lock `emergency_release` takes.
+        if let Err(e) = &done
+            && e.code() == windows::Win32::Foundation::E_OUTOFMEMORY
+        {
+            emergency_release();
+            done = reset();
+        }
+        if let Err(e) = done {
             fail(format_args!("a host command list did not reset ({e})"));
         }
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
+    }
+
+    /// Makes this list's allocator anew, for one whose last submission has
+    /// run and that is [`HostList::reset`] before it records again: an
+    /// allocator keeps the memory of the most it ever held through its
+    /// resets (`crate::list::recycle` says when). False if the device made
+    /// none; the old one then stays.
+    pub(crate) fn renew_allocator(&mut self) -> bool {
+        let Some(host) = host() else {
+            return false;
+        };
+        // SAFETY: plain object creation. The old allocator goes: the list it
+        // recorded is closed and has run, and is reset with the new one.
+        match unsafe { host.device.CreateCommandAllocator::<ID3D12CommandAllocator>(D3D12_COMMAND_LIST_TYPE_DIRECT) } {
+            Ok(allocator) => {
+                self.allocator = allocator;
+                self.list.renewed();
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Something changed in this list that bringing a draw's textures and
@@ -7006,7 +7181,7 @@ impl HostList {
         }
         let Some((allocator, list)) = self
             .prelude
-            .get_or_init(|| host().and_then(|h| h.make_prelude()))
+            .get_or_init(|| host().and_then(|h| or_after_release(|| h.make_prelude())))
             .as_ref()
         else {
             fail(format_args!("no host list for a state prelude"));
@@ -10019,11 +10194,85 @@ pub(crate) fn legal_for(flags: u32, state: u32) -> u32 {
         .fold(state, |s, &(_, _, bits)| s & !bits)
 }
 
+pub(crate) use crate::resource::small_card;
+
+/// The budget of the card's own memory the layer works by, for the
+/// system's `raw` one: on a small card ([`small_card`]) the system's less
+/// a twentieth of it, at least 384 MiB (not more than a quarter), else the
+/// system's. Every rule that keeps a share of the budget free (90 %, 85 %,
+/// 80 % and the others) then keeps that much more free of what the title
+/// itself does not count: the swap chain, the driver's own memory, other
+/// programs on the desktop. On a card of 8 GB, at 97 % of the system's
+/// budget, the system moves memory to the PC's, which crosses the bus at
+/// every read (and the PC's memory is short there too).
+///
+/// `VICTORY_VRAM_MB` (`set`, in bytes here) wins: that many MB at most, on
+/// any card (the system's budget if that is less); `0`: the system's budget
+/// as it is, as before.
+pub(crate) fn effective_budget(raw: u64, set: Option<u64>) -> u64 {
+    match set {
+        Some(0) => raw,
+        Some(most) => raw.min(most),
+        None if small_card(raw) => raw - (384u64 << 20).max(raw / 20).min(raw / 4),
+        None => raw,
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::{effective_budget, small_card};
+
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn a_small_card_works_by_less_than_the_system_gives() {
+        // A card of 8 GB: the system gives some 7.3 GB; 384 MiB less.
+        assert_eq!(effective_budget(7_300 * MIB, None), 6_916 * MIB);
+        // A twentieth when that is more: at 12 GiB, 614 MiB.
+        assert_eq!(effective_budget(12 * GIB, None), 12 * GIB - 12 * GIB / 20);
+        // Never more than a quarter of a very small one.
+        assert_eq!(effective_budget(1024 * MIB, None), 768 * MIB);
+        assert!(small_card(effective_budget(7_300 * MIB, None)));
+    }
+
+    #[test]
+    fn a_card_with_room_works_by_what_the_system_gives() {
+        // The RX 7900 XTX: some 23.5 GB.
+        assert_eq!(effective_budget(23_500 * MIB, None), 23_500 * MIB);
+        assert_eq!(effective_budget(12 * GIB + 1, None), 12 * GIB + 1);
+        assert!(!small_card(12 * GIB + 1));
+        // No budget said.
+        assert_eq!(effective_budget(0, None), 0);
+        assert!(!small_card(0));
+    }
+
+    #[test]
+    fn vram_mb_wins_on_any_card() {
+        assert_eq!(effective_budget(23_500 * MIB, Some(7_000 * MIB)), 7_000 * MIB);
+        assert_eq!(effective_budget(7_300 * MIB, Some(7_200 * MIB)), 7_200 * MIB);
+        // Never more than the system gives.
+        assert_eq!(effective_budget(7_300 * MIB, Some(16_000 * MIB)), 7_300 * MIB);
+        // 0: the system's, as before.
+        assert_eq!(effective_budget(7_300 * MIB, Some(0)), 7_300 * MIB);
+    }
+}
+
+/// `VICTORY_VRAM_MB` in bytes ([`effective_budget`]).
+fn vram_set() -> Option<u64> {
+    static SET: OnceLock<Option<u64>> = OnceLock::new();
+    *SET.get_or_init(|| {
+        std::env::var("VICTORY_VRAM_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map(|mb| mb.saturating_mul(1 << 20))
+    })
+}
+
 impl Host {
     /// The card's memory as the system accounts it to this process, in
     /// bytes: the budget and the use of the card's own memory, then of the
     /// PC's memory shared with the card (where the system moves what does
-    /// not fit on the card).
+    /// not fit on the card). The first is the budget the layer works by
+    /// ([`effective_budget`]: on a small card less than the system's, said
+    /// once); [`Self::video_memory_groups`] has the system's own numbers.
     pub(crate) fn video_memory(&self) -> Option<[u64; 4]> {
         let adapter = self.adapter.as_ref()?;
         let mut own = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
@@ -10057,7 +10306,17 @@ impl Host {
             );
             self.log_video_memory("right after that change");
         }
-        Some([own.Budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
+        let budget = effective_budget(own.Budget, vram_set());
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if budget != own.Budget && !SAID.swap(true, Ordering::Relaxed) {
+            tracing::info!(
+                "the card's budget: the system gives {} MB, the layer works by {} MB (VICTORY_VRAM_MB; else on a card \
+                 of 12 GiB or less a twentieth less, at least 384 MiB)",
+                own.Budget >> 20,
+                budget >> 20
+            );
+        }
+        Some([budget, own.CurrentUsage, shared.Budget, shared.CurrentUsage])
     }
 
     /// Both of the system's memory groups for this process, in bytes: for
@@ -10158,6 +10417,7 @@ impl Host {
         match made {
             Ok(()) => Some((buffer?, data.cast())),
             Err(e) => {
+                crate::residency::refused(&e);
                 tracing::warn!(error = %e, size, "no shared buffer");
                 None
             }
