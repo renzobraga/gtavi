@@ -10013,7 +10013,7 @@ impl Host {
                 tracing::warn!("VICTORY_TEARING=1: this system does not let presents tear; they wait as without it");
             }
             let flags = if tearing { DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING } else { DXGI_SWAP_CHAIN_FLAG(0) };
-            let desc = DXGI_SWAP_CHAIN_DESC1 {
+            let desc = |flags: DXGI_SWAP_CHAIN_FLAG| DXGI_SWAP_CHAIN_DESC1 {
                 Width: width,
                 Height: height,
                 Format: format,
@@ -10027,9 +10027,24 @@ impl Host {
                 Flags: flags.0 as u32,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            let made = factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc(flags), None, None);
+            // A swap chain that allows tearing refused where the system said it could (a
+            // driver's or the window's quirk): one without it, as without the switch, whose
+            // flags every resize and present then follows. (Else no frame would ever show,
+            // the next frame asking for the same chain again.)
+            let (swap_chain, flags, tearing) = match made {
+                Err(error) if tearing => {
+                    tracing::warn!(
+                        %error,
+                        "VICTORY_TEARING=1: a swap chain that allows tearing was refused; one without it, \
+                         presents wait as without the switch"
+                    );
+                    let none = DXGI_SWAP_CHAIN_FLAG(0);
+                    (factory.CreateSwapChainForHwnd(&self.queue, hwnd, &desc(none), None, None)?, none, false)
+                }
+                made => (made?, flags, tearing),
+            };
+            let swap_chain = swap_chain.cast::<IDXGISwapChain3>()?;
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
