@@ -43,6 +43,7 @@ pub(crate) struct Staging {
     _piece: Option<crate::pool::StagingPiece>,
     /// Its bytes.
     #[cfg(feature = "diagnostics")]
+    #[allow(dead_code)] // (kept for a look in a debugger; nothing reads it)
     size: u64,
     data: *mut u8,
     footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
