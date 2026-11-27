@@ -113,6 +113,29 @@ target\diag\victory.exe shaders <the shader archives>   # every shader translate
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
+### On a smaller PC (16 GB of RAM, a card of 8 GB, NVIDIA)
+
+Untested on such a PC so far. The launcher says what the PC is when it starts
+(`host ...`) and adapts to it, each choice on a line of its own (`host preset
+...`), only where the variable is not set already:
+
+- with 24 GB of RAM or less, or a card of 10 GB or less, `--console auto` (the
+  default) takes the Series S profile;
+- on a card that is not AMD's, the title's own upscaler (`VICTORY_UPSCALER=6`)
+  replaces the console FidelityFX, which has only ever run on AMD;
+- the memory switches go on (`VICTORY_RESIDENCY=1`, smaller windows, texture
+  levels on demand), and so does crash tracing of the faulting address alone;
+- the layer works by the card's budget less a reserve, follows the PC's memory
+  that the card shares, and asks a second time after `E_OUTOFMEMORY`;
+- the thread pools are sized for the PC's cores, and AVX-512 is used where the
+  CPU has it.
+
+`-More @{VICTORY_HOST_PRESET='0'}` leaves all of the launcher's choices out.
+`-Vrr` lets a G-SYNC or FreeSync display follow the frame rate. `-Fsr4K` needs
+an RDNA 4 Radeon and is refused at once elsewhere. A fixed paging file of
+32768 MB or more is needed. The steps, every new switch and what to measure:
+[docs/pc-16gb-rtx5060ti-8gb.md](docs/pc-16gb-rtx5060ti-8gb.md) (in Portuguese).
+
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
