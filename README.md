@@ -130,7 +130,9 @@ Untested on such a PC so far. The launcher says what the PC is when it starts
 - the thread pools are sized for the PC's cores, and AVX-512 is used where the
   CPU has it.
 
-`-More @{VICTORY_HOST_PRESET='0'}` leaves all of the launcher's choices out.
+`-More @{VICTORY_HOST_PRESET='0'}` leaves out the choices of the launcher and of
+`play.ps1`; what the layer adapts by itself stays (the guide lists the switches
+for a run near the one before).
 `-Vrr` lets a G-SYNC or FreeSync display follow the frame rate. `-Fsr4K` needs
 an RDNA 4 Radeon and is refused at once elsewhere. A fixed paging file of
 32768 MB or more is needed. The steps, every new switch and what to measure:

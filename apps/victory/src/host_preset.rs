@@ -344,6 +344,13 @@ fn wide(env: &dyn Fn(&str) -> Option<String>) -> bool {
     env("VICTORY_INDIRECT_WIDE").as_deref() == Some("1")
 }
 
+/// `VICTORY_FSR_ANY_PROVIDER=1`, read as `victory-hle` `fidelityfx.rs` reads
+/// it (`any_provider`: `1` exactly): -Fsr4K tried on a card that is not
+/// AMD's, which is otherwise refused before the title runs.
+fn any_provider(env: &dyn Fn(&str) -> Option<String>) -> bool {
+    env("VICTORY_FSR_ANY_PROVIDER").as_deref() == Some("1")
+}
+
 /// The warnings, which refuse nothing: on a PC with little RAM a commit
 /// limit under the RAM and [`COMMIT_ABOVE_RAM`], and on a card other than
 /// AMD's a render size of more tiles than [`MOST_GROUPS`] (not with
@@ -371,7 +378,11 @@ fn warnings(
             gib(m.total + COMMIT_ABOVE_RAM),
         ));
     }
-    if probe.not_amd() && !wide(env) {
+    // (With -Fsr4K on such a card the launcher refuses the run a moment
+    // later, `fsr_4k::check_host_card`, unless VICTORY_FSR_ANY_PROVIDER=1:
+    // then a lower FSR input would be no help to say.)
+    let refused_fsr = fsr_input.is_some() && !any_provider(env);
+    if probe.not_amd() && !wide(env) && !refused_fsr {
         let size = render_size(console, fsr_input, env);
         let tiles = tiles(size);
         if tiles > MOST_GROUPS {
@@ -900,16 +911,28 @@ mod tests {
         let d = decide(&small_pc(), &quality, &none);
         assert_eq!(d.console, Profile::SeriesX);
         assert!(!names(&d).contains(&"VICTORY_UPSCALER"));
+        // On the NVIDIA card -Fsr4K is refused a moment later
+        // (`fsr_4k::check_host_card`): no advice on its input size.
+        assert!(
+            !d.warnings.iter().any(|w| w.contains("tile")),
+            "{:?}",
+            d.warnings
+        );
+        // Tried there all the same (VICTORY_FSR_ANY_PROVIDER=1): it is said.
+        let any = |name: &str| (name == "VICTORY_FSR_ANY_PROVIDER").then(|| "1".to_owned());
+        let d = decide(&small_pc(), &quality, &any);
         assert!(
             d.warnings
                 .iter()
-                .any(|w| w.contains("2560x1440") && w.contains("performance"))
+                .any(|w| w.contains("2560x1440") && w.contains("performance")),
+            "{:?}",
+            d.warnings
         );
         let performance = Asked {
             console: Console::Auto,
             fsr_input: Some([1920, 1080]),
         };
-        let d = decide(&small_pc(), &performance, &none);
+        let d = decide(&small_pc(), &performance, &any);
         assert!(
             !d.warnings.iter().any(|w| w.contains("tile")),
             "{:?}",

@@ -555,7 +555,7 @@ fn sweep() {
     }
     #[cfg(feature = "diagnostics")]
     crate::book::check();
-    crate::residency::refresh();
+    let pressure_began = crate::residency::refresh();
     let memory = host().and_then(|h| h.video_memory());
     let entered_high = crate::residency::refresh_shared(memory) == Some(crate::residency::Shared::High);
     say_plan(memory);
@@ -565,8 +565,13 @@ fn sweep() {
     // Not each second: on a PC of 16 GB that band may last the whole run,
     // and the caps keep it so as things come back. Scratch chunks let go
     // each second were made again by the next lists, some 310 us an
-    // allocation.)
-    if crate::residency::pressured() || entered_high {
+    // allocation. The same of `VICTORY_RESIDENCY=1`'s pressure on a PC short
+    // of memory, `crate::residency::short_of_ram`: of 24 GiB or less it
+    // lasts the whole run there, under 5 GiB free, and [`spare_chunks_most`]
+    // keeps 128 MiB of chunks at most; elsewhere they go each second of it,
+    // as before.)
+    let short = crate::residency::short_of_ram();
+    if (crate::residency::pressured() && !short) || pressure_began || entered_high {
         trim_spare_chunks();
     }
     if entered_high {

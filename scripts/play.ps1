@@ -8,7 +8,8 @@
 # -Vrr          tearing allowed, so that a G-SYNC or FreeSync display follows the frame rate in a window
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -More         other settings: -More @{VICTORY_PANEL='1'}; -More @{VICTORY_HOST_PRESET='0'} leaves out
-#               what the launcher chooses for a smaller PC (it says each choice when it starts)
+#               what the launcher and this script choose for a smaller PC (the launcher says each
+#               choice when it starts); what the layer itself adapts stays (docs/pc-16gb-rtx5060ti-8gb.md)
 # With fewer than 16 logical processors the title's thread priorities are not kept as it sets them (six
 # of its threads at idle then wait seconds for a turn); with 24 GB of RAM or less crash tracing keeps the
 # faulting address only (VICTORY_D3D12_DRED='faults' instead of 'light': no breadcrumbs).
@@ -29,12 +30,14 @@ $settings = @{
     VICTORY_INDIRECT_BATCH = '2'; VICTORY_MAP_THREADS = '1'; VICTORY_CARD_AWAKE = '1'
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'
 }
+# (VICTORY_HOST_PRESET=0, as the launcher reads it: neither choice below, as before them.)
+$preset = -not ($More.ContainsKey('VICTORY_HOST_PRESET') -and "$($More['VICTORY_HOST_PRESET'])".Trim() -eq '0')
 # The title's own priorities only where processors are to spare: on 12 logical processors its six idle
 # threads, the streaming pager's among them, wait for a turn (victory-hle kernel.rs, SetThreadPriority).
-if ([Environment]::ProcessorCount -ge 16) { $settings.VICTORY_TITLE_PRIORITIES = '0' }
+if (-not $preset -or [Environment]::ProcessorCount -ge 16) { $settings.VICTORY_TITLE_PRIORITIES = '0' }
 # Breadcrumbs cost memory with every list; the faulting address of a lost device is still kept.
 $ram = 0
-try { $ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory } catch { }
+if ($preset) { try { $ram = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).TotalPhysicalMemory } catch { } }
 if ($ram -gt 0 -and $ram -le 24GB) { $settings.VICTORY_D3D12_DRED = 'faults' }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'

@@ -59,9 +59,13 @@ pub(crate) fn room(memory: Option<[u64; 4]>) {
     }
     // (`VICTORY_RESIDENCY=1`, codec-d/cool_fox c64fc9b4/e94d277a: fewer
     // spares while the system is short of memory, and idle blocks let go now,
-    // not at the pool's next allocation.)
+    // not at the pool's next allocation. On a PC short of memory, `short`,
+    // that pressure lasts the whole run, and the blocks of textures are the
+    // card's memory: they follow its room as without `VICTORY_RESIDENCY`,
+    // at least the blocks made ahead, `texture_spares_most`, and only the
+    // staging buffers, the PC's memory, go for the PC's want of it.)
     let pressure = crate::residency::pressured();
-    let limit = spares(memory, crate::host::keep_freed() && !pressure);
+    let limit = spares(memory, crate::host::keep_freed() && (!pressure || short));
     SPARES.store(limit, Ordering::Relaxed);
     STAGING_SPARES.store(staging_spares(limit, short), Ordering::Relaxed);
     let tick = now();

@@ -285,12 +285,13 @@ fn next_pressure(was: bool, physical: u64, commit: u64) -> bool {
     }
 }
 
-/// Called by the once-per-second submission sweep. A failed sample keeps the last good state.
-pub(crate) fn refresh() {
+/// Called by the once-per-second submission sweep: whether the system has
+/// just become short of memory. A failed sample keeps the last good state.
+pub(crate) fn refresh() -> bool {
     if !on() {
-        return;
+        return false;
     }
-    let Some(status) = memory_status() else { return };
+    let Some(status) = memory_status() else { return false };
     let (physical, commit) = (status.ullAvailPhys, status.ullAvailPageFile);
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
@@ -313,6 +314,7 @@ pub(crate) fn refresh() {
             tracing::info!(physical_free_mib = physical >> 20, available_commit_mib = commit >> 20, "host memory pressure cleared");
         }
     }
+    pressure && !was
 }
 
 pub(crate) fn headroom() -> Option<u64> {

@@ -1520,11 +1520,14 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
-    // So many inflate or unpack at once (`decodes`), the write into the
-    // destination with it; the read above is not counted.
-    let _turn = decoding();
+    // So many inflate or unpack at once (`decodes`): a turn is held while
+    // the bytes are made, not while the read above waits for the disk nor
+    // while a destination's page list or its pages are waited for and tried
+    // again (`into_destination`, `into_pages`: up to some 1.5 s each), where
+    // it would keep the other workers from decoding.
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
+        let _turn = decoding();
         let mut packed = vec![0; request.intermediate_size as usize];
         let n = inflate(&source, &mut packed).map_err(|hr| fail(hr, "zlib"))?;
         packed.truncate(n);
@@ -1532,11 +1535,14 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     } else {
         source
     };
-    into_destination(request, size, |out| match tables {
-        Some(tables) => bcpack::decode(bc, &source, out, tables)
-            .map(|()| out.len())
-            .map_err(|e| fail(INVALID_DATA, &e.to_string())),
-        None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+    into_destination(request, size, |out| {
+        let _turn = decoding();
+        match tables {
+            Some(tables) => bcpack::decode(bc, &source, out, tables)
+                .map(|()| out.len())
+                .map_err(|e| fail(INVALID_DATA, &e.to_string())),
+            None => inflate(&source, out).map_err(|hr| fail(hr, "zlib")),
+        }
     })?;
     tracing::trace!(
         options = format_args!("{options:#x}"),

@@ -137,7 +137,7 @@ Dentro da camada, sem nenhuma variável:
 |---|---|
 | O perfil Series X (saída 4K, muito pesado para 8 GB) | `-Console series-x`, e de preferência `-More @{VICTORY_OUTPUT='1920x1080'}` |
 | Series S com o FidelityFX de console | `-Console series-s` (sem o `VICTORY_UPSCALER=6`) ou `-More @{VICTORY_UPSCALER='7'}` |
-| Nenhuma das escolhas do launcher | `-More @{VICTORY_HOST_PRESET='0'}` |
+| Nenhuma das escolhas do launcher e do `play.ps1` (a camada continua se adaptando, veja abaixo) | `-More @{VICTORY_HOST_PRESET='0'}` |
 | Passar de 30 fps | `-More @{VICTORY_FRAME_INTERVAL_MS='16.667'}` |
 | O modo seguro | `-Safe` |
 
@@ -148,7 +148,7 @@ desenvolvimento nada muda.
 
 | Interruptor | O que faz |
 |---|---|
-| `VICTORY_HOST_PRESET=0` | Desliga o perfil automático (dá Series X) e todos os ajustes do launcher. A linha `host` e os avisos continuam |
+| `VICTORY_HOST_PRESET=0` | Desliga o perfil automático (dá Series X), os ajustes do launcher (as linhas `host preset`) e os dois do `play.ps1` (prioridades, DRED). A linha `host` e os avisos continuam. O que a própria camada adapta (memória, threads, AVX-512) continua |
 | `--console auto\|series-x\|series-s` / `-Console` | Perfil do console; `auto` é o padrão |
 | `VICTORY_VRAM_MB=<n>` | A camada trabalha com no máximo `n` MB da placa; `0` usa o orçamento do sistema sem reserva |
 | `VICTORY_SMALL_RAM=0\|1` | Força o veredito "PC de pouca RAM" da camada |
@@ -166,6 +166,21 @@ desenvolvimento nada muda.
 | `VICTORY_LANE_CORE=1` | Agora também funciona num processador de núcleos iguais: a thread de envio ganha um núcleo só dela |
 
 Exemplo: `scripts\play.ps1 -Exe "..." -Vrr -More @{VICTORY_SIMD='avx2'}`.
+
+Para comparar com o comportamento de antes destas mudanças, o mais perto
+possível neste PC:
+
+```powershell
+scripts\play.ps1 -Exe "..." -Console series-s -More @{
+    VICTORY_HOST_PRESET='0'; VICTORY_SMALL_RAM='0'; VICTORY_SHARED_BAND='0'; VICTORY_VRAM_MB='0'
+    VICTORY_LIST_RENEW='0'; VICTORY_SIMD='avx2'; VICTORY_DSTORAGE_DECODES='12'; VICTORY_RECORDS_THREADS='6'
+    VICTORY_THIN_THREADS='8'; VICTORY_PIPELINE_WORKERS='8'; VICTORY_WIDE_ABOVE='0'; VICTORY_STREAM_PRIORITY='1'
+}
+```
+
+Continuam ligadas só as regras de placa pequena: o piso de texturas, o espaço
+para *render targets* e os blocos vazios de textura. Elas valem para qualquer
+orçamento de 12 GB ou menos e não têm interruptor.
 
 ## 6. O que não dá nesta placa
 
@@ -198,8 +213,10 @@ Mande o `run.log`, o `crashes.log` (em `%LOCALAPPDATA%\victory\data`) e:
    cada vez:
    - `-More @{VICTORY_SIMD='avx2'}`
    - `-More @{VICTORY_UPSCALER='7'}`
-   - `-More @{VICTORY_HOST_PRESET='0'} -Console series-s`
+   - `-More @{VICTORY_HOST_PRESET='0'} -Console series-s` (só as escolhas do
+     launcher e do `play.ps1` saem)
    - sem `-Vrr`
+   - uma execução perto da antiga (abaixo)
 6. **Imagem:** blocos ou corrupção no pé da imagem, texturas que demoram a
    aparecer e engasgos de um em um segundo.
 7. **Uma mensagem `out of memory (E_OUTOFMEMORY): let go of ...`**, se aparecer,
