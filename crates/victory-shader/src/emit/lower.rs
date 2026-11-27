@@ -59,6 +59,10 @@ pub(crate) struct Lowered {
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
     pub wave_size: Option<u32>,
+    /// The thread-group shared memory it declares, in bytes, with the dwords
+    /// a console wave64 program run in host waves of 32 adds (diagnostics:
+    /// `super::narrow_refusal`).
+    pub shared_bytes: u32,
     /// Heap handles made with a non-uniform index.
     #[cfg(test)]
     pub nonuniform_handles: u32,
@@ -2856,8 +2860,10 @@ impl<'a> Lower<'a> {
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
+        let shared_bytes = self.s.shared_bytes();
         Ok(Lowered {
             wave_size,
+            shared_bytes,
             cmp_samplers,
             root_cbvs,
             root_srvs,

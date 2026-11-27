@@ -2869,6 +2869,11 @@ impl State {
                 unsafe { list.list.SetComputeRoot32BitConstant(param, threads[0], word) };
             }
         }
+        // More than 65,535 groups in a dimension still run as asked; on a card
+        // that is not AMD's the first such dispatch is told.
+        if crate::indirect::past_limit([x, y, z]) {
+            crate::indirect::note_wide_direct([x, y, z]);
+        }
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         self.buffers_written();

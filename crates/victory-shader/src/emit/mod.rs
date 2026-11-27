@@ -461,7 +461,104 @@ pub fn emit_with_retries(
 }
 
 /// Emits a program whose earlier stages already ran.
+///
+/// A compute program that a host of 32-lane waves will refuse
+/// ([`narrow_refusal`]) is counted ([`narrow_refusals`]); what is emitted is
+/// the same.
 pub fn emit(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    OVER_SHARED.with_borrow_mut(Vec::clear);
+    let emitted = emit_tried(c, native, p, st, io, res);
+    if let Ok(shader) = &emitted
+        && let Some(why) = narrow_refusal(shader)
+    {
+        let at = usize::from(matches!(why, NarrowRefusal::GroupShared(_)));
+        NARROW_REFUSED[at].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    emitted
+}
+
+/// The most thread-group shared memory a D3D12 compute program declares:
+/// 32 KiB (`D3D12_CS_TGSM_REGISTER_COUNT` dwords). The console's groups have
+/// up to 64 KiB.
+pub const MOST_GROUP_SHARED: u32 = 32 << 10;
+
+/// Why a host whose waves are at most 32 lanes (NVIDIA) refuses a translated
+/// compute program when its pipeline is made ([`narrow_refusal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NarrowRefusal {
+    /// It declares `WaveSize(64)`: a console wave64 program whose cross-lane
+    /// code could not be kept in 32-lane halves, nor taken as two host waves
+    /// (`VICTORY_WAVE_WHY=1` prints why, as it is translated).
+    Wave64,
+    /// Its thread-group shared memory, in bytes: over [`MOST_GROUP_SHARED`]
+    /// with the dwords two host waves of 32 exchange through and count their
+    /// threads in, added to the console program's own.
+    GroupShared(u32),
+}
+
+/// How many translations since the start a host of 32-lane waves will
+/// refuse ([`NarrowRefusal`]): for 64-lane waves, for group-shared memory.
+pub fn narrow_refusals() -> [u32; 2] {
+    NARROW_REFUSED.each_ref().map(|n| n.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+static NARROW_REFUSED: [std::sync::atomic::AtomicU32; 2] = [const { std::sync::atomic::AtomicU32::new(0) }; 2];
+
+thread_local! {
+    /// The containers this thread's lowerings of the current translation made
+    /// with more group-shared memory than a host of 32-lane waves takes
+    /// ([`NarrowRefusal::GroupShared`]), by digest, with their bytes. Emptied
+    /// as each [`emit`] starts; the one a translation returns is found by its
+    /// digest, whichever of its forms it was.
+    static OVER_SHARED: std::cell::RefCell<Vec<([u8; 16], u32)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Whether the host (its waves of at most 32 lanes, [`set_host_max_wave`])
+/// refuses `shader`'s pipeline, and why. `None` on any other host (AMD) and
+/// for any but a compute program. Only diagnostics: the translation is the
+/// one the host is given either way. The wave size is read from the
+/// container (a cached translation too); the group-shared memory is known on
+/// the thread that translated it, until that thread's next translation.
+pub fn narrow_refusal(shader: &HostShader) -> Option<NarrowRefusal> {
+    if shader.stage != HwStage::Cs || lower::host_max_wave() != 32 {
+        return None;
+    }
+    let digest = shader.dxil.get(4..20)?;
+    let shared = OVER_SHARED.with_borrow(|over| over.iter().find(|(d, _)| d[..] == *digest).map(|&(_, bytes)| bytes));
+    refusal(declared_wave_size(&shader.dxil), shared.unwrap_or(0))
+}
+
+/// [`narrow_refusal`] for a program declaring the wave size `wave` and
+/// `shared` bytes of group-shared memory, on a host of 32-lane waves.
+fn refusal(wave: Option<u32>, shared: u32) -> Option<NarrowRefusal> {
+    if wave == Some(64) {
+        Some(NarrowRefusal::Wave64)
+    } else if shared > MOST_GROUP_SHARED {
+        Some(NarrowRefusal::GroupShared(shared))
+    } else {
+        None
+    }
+}
+
+/// The wave size a translated container requires of the host (`WaveSize`),
+/// as its `PSV0` part gives it: the same least and most lane counts.
+pub fn declared_wave_size(dxil: &[u8]) -> Option<u32> {
+    let psv = Container::parse(dxil).ok()?.part(FourCC::PSV0)?.data;
+    let word = |at: usize| psv.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    // (after the runtime information's size: its words 4 and 5)
+    let (least, most) = (word(4 + 16)?, word(4 + 20)?);
+    (least == most && least != 0).then_some(least)
+}
+
+/// [`emit`].
+fn emit_tried(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,
@@ -805,6 +902,14 @@ fn emit_program(
         prims,
         mesh_stride,
     })?;
+    // (diagnostics: [`narrow_refusal`])
+    if native.stage == HwStage::Cs
+        && l.shared_bytes > MOST_GROUP_SHARED
+        && lower::host_max_wave() == 32
+        && let Some(digest) = l.dxil.get(4..20).and_then(|d| <[u8; 16]>::try_from(d).ok())
+    {
+        OVER_SHARED.with_borrow_mut(|over| over.push((digest, l.shared_bytes)));
+    }
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,
@@ -3201,5 +3306,133 @@ mod barycentric_tests {
         let [e0, e1] = exp_mrt0(4);
         let words = [0xC812_0000, e0, e1, S_ENDPGM];
         assert!(pixel(&words, PERSP_CENTER).is_err());
+    }
+}
+
+#[cfg(test)]
+mod narrow_tests {
+    use super::{NarrowRefusal, container, declared_wave_size, emit, narrow_refusal, narrow_refusals, refusal};
+    use crate::dxbc::Container;
+    use crate::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+    use crate::{io, ir, resource, structure};
+
+    #[test]
+    fn a_program_is_refused_for_64_lane_waves_first_then_for_its_shared_memory() {
+        assert_eq!(refusal(Some(64), 0), Some(NarrowRefusal::Wave64));
+        assert_eq!(refusal(Some(64), 40_000), Some(NarrowRefusal::Wave64));
+        assert_eq!(refusal(Some(32), 32_772), Some(NarrowRefusal::GroupShared(32_772)));
+        assert_eq!(refusal(None, 32_769), Some(NarrowRefusal::GroupShared(32_769)));
+        assert_eq!(refusal(Some(32), 32_768), None);
+        assert_eq!(refusal(None, 0), None);
+    }
+
+    /// A container whose `PSV0` names `least` and `most` lanes.
+    fn with_lanes(least: u32, most: u32) -> Vec<u8> {
+        let mut psv = 48u32.to_le_bytes().to_vec();
+        let mut info = [0u8; 48];
+        info[16..20].copy_from_slice(&least.to_le_bytes());
+        info[20..24].copy_from_slice(&most.to_le_bytes());
+        psv.extend(info);
+        container::build(&[(b"PSV0", &psv)])
+    }
+
+    #[test]
+    fn the_wave_size_is_read_from_the_containers_psv0() {
+        assert_eq!(declared_wave_size(&with_lanes(64, 64)), Some(64));
+        assert_eq!(declared_wave_size(&with_lanes(32, 32)), Some(32));
+        assert_eq!(declared_wave_size(&with_lanes(0, u32::MAX)), None);
+        assert_eq!(declared_wave_size(&container::build(&[])), None);
+        assert_eq!(declared_wave_size(b"not a container"), None);
+    }
+
+    /// A console wave64 compute program of 64 threads with 32 KiB of LDS: each
+    /// thread writes its index at its dword, reads it back and stores it.
+    fn full_lds() -> NativeProgram {
+        let words: [u32; 11] = [
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
+            0xD834_0000,
+            0x0000_0001, // ds_write_b32 v1, v0
+            0xD8D8_0000,
+            0x0200_0001, // ds_read_b32 v2, v1
+            0x38 << 26 | 0x1C << 18,
+            0x80 << 24 | 2 << 16 | 2 << 8, // buffer_store_dword v2, off, s[8:11], 0
+            0xBF81_0000, // s_endpgm
+        ];
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1 | (super::MOST_GROUP_SHARED / 512) << 15,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// `native` emitted for a host whose waves have at most `lanes` lanes, and
+    /// what such a host refuses of it.
+    fn emitted_on(native: &NativeProgram, lanes: u32) -> (super::HostShader, Option<NarrowRefusal>) {
+        let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+        let st = structure::structure(&p).expect("structure");
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+        let io = io::raise(&p, native).expect("io::raise");
+        let c = Container {
+            digest: [0; 16],
+            version: (1, 0),
+            parts: Vec::new(),
+        };
+        super::set_thread_max_wave(Some(lanes));
+        let shader = emit(&c, native, &p, &st, &io, &res).expect("emit");
+        let why = narrow_refusal(&shader);
+        super::set_thread_max_wave(None);
+        (shader, why)
+    }
+
+    /// In waves of 32 the program's 32 KiB get the dword two host waves count
+    /// their threads in: one more than D3D12 takes, which is told and counted.
+    /// In waves of 64 it is the console's and nothing is told.
+    #[test]
+    fn group_shared_memory_past_32_kib_in_waves_of_32_is_told() {
+        let native = full_lds();
+        let before = narrow_refusals()[1];
+        let (narrow, why) = emitted_on(&native, 32);
+        assert_eq!(declared_wave_size(&narrow.dxil), Some(32));
+        assert_eq!(why, Some(NarrowRefusal::GroupShared(super::MOST_GROUP_SHARED + 4)));
+        assert!(narrow_refusals()[1] > before);
+        let (wide, why) = emitted_on(&native, 64);
+        assert_eq!(declared_wave_size(&wide.dxil), Some(64));
+        assert_eq!(why, None);
     }
 }

@@ -275,10 +275,109 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// its last 1,905 tiles, the lowest of the picture. The console runs what it
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. Other cards stay at 65,535.
+/// indirect counts. Other cards stay at 65,535 unless `VICTORY_INDIRECT_WIDE=1`
+/// asks for 2^20 on them too: an experiment for NVIDIA, whose cards take more
+/// groups in x than D3D12 names (whether their driver runs an indirect record
+/// of more as asked, cuts it or loses the device is not known; with it off,
+/// the lowest tiles of the picture stay blocky at 2560x1440 and up).
+///
+/// On other cards the configuration is logged once, as the cut happens on the
+/// card where nothing is read back.
 fn widest(amd: bool) -> u32 {
-    let on = std::env::var_os("VICTORY_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+    let wide = wide_limit(amd, std::env::var("VICTORY_INDIRECT_WIDE").ok().as_deref());
+    if !amd {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if wide == 65_535 {
+                tracing::warn!(
+                    "indirect dispatches of more than 65,535 groups in x are cut to 65,535 on this card \
+                     (not AMD): at 2560x1440 and up the lowest tiles of the picture can stay blocky; a \
+                     lower output size (VICTORY_OUTPUT) or render scale (VICTORY_RENDER_SCALE) stays \
+                     under it, VICTORY_INDIRECT_WIDE=1 runs them as asked (an experiment)"
+                );
+            } else {
+                tracing::warn!(
+                    "VICTORY_INDIRECT_WIDE=1: indirect dispatches of up to 2^20 groups in x run as asked \
+                     on this card (not AMD), past the 65,535 D3D12 names (an experiment)"
+                );
+            }
+        });
+    }
+    wide
+}
+
+/// [`widest`] for a card that is AMD's or not, with `VICTORY_INDIRECT_WIDE`
+/// set to `wide` (`None`: unset): `1` is 2^20 on any card, `0` 65,535 on
+/// any card, unset or any other value 2^20 on AMD's alone.
+fn wide_limit(amd: bool, wide: Option<&str>) -> u32 {
+    match wide {
+        Some("1") => 1 << 20,
+        Some("0") => 65_535,
+        _ if amd => 1 << 20,
+        _ => 65_535,
+    }
+}
+
+/// Whether the host device is an AMD card's ([`amd`]), asked once.
+pub(crate) fn host_amd() -> bool {
+    static AMD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AMD.get_or_init(|| host().is_some_and(|h| amd(&h.device)))
+}
+
+/// Whether a dispatch of `groups` (x, y, z) has more than 65,535 in a
+/// dimension, the most D3D12 names for one.
+pub(crate) fn past_limit(groups: [u32; 3]) -> bool {
+    groups.iter().any(|&n| n > 65_535)
+}
+
+/// A direct dispatch of `groups` [`past_limit`], which runs as asked, as
+/// before. An AMD card runs it whole (as it runs the indirect ones,
+/// [`widest`]); on other cards the first is told, with its counts, as what
+/// such a card does with it is not known (it may cut it). Nothing on an AMD
+/// card.
+pub(crate) fn note_wide_direct(groups: [u32; 3]) {
+    if host_amd() {
+        return;
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        tracing::warn!(
+            ?groups,
+            "a dispatch of more than 65,535 groups in a dimension on a card that is not AMD's: D3D12 \
+             does not say what it runs (it may be cut, and parts of the picture missing or blocky); a \
+             lower output size (VICTORY_OUTPUT) or render scale (VICTORY_RENDER_SCALE) makes it smaller"
+        );
+    });
+}
+
+#[cfg(test)]
+mod wide_tests {
+    use super::{past_limit, wide_limit};
+
+    /// Unset, an AMD card runs 2^20 groups in x and others 65,535, as
+    /// before; `0` is 65,535 on both, and only `1` widens other cards.
+    #[test]
+    fn the_widest_dispatch_follows_the_card_and_the_switch() {
+        assert_eq!(wide_limit(true, None), 1 << 20);
+        assert_eq!(wide_limit(false, None), 65_535);
+        assert_eq!(wide_limit(true, Some("0")), 65_535);
+        assert_eq!(wide_limit(false, Some("0")), 65_535);
+        assert_eq!(wide_limit(true, Some("1")), 1 << 20);
+        assert_eq!(wide_limit(false, Some("1")), 1 << 20);
+        for other in ["", "2", "yes", " 1"] {
+            assert_eq!(wide_limit(true, Some(other)), 1 << 20, "{other:?}");
+            assert_eq!(wide_limit(false, Some(other)), 65_535, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn a_dispatch_past_the_limit_is_one_of_more_than_65535_in_a_dimension() {
+        assert!(!past_limit([65_535, 65_535, 65_535]));
+        assert!(!past_limit([0, 0, 0]));
+        assert!(past_limit([65_536, 1, 1]));
+        assert!(past_limit([1, 67_440, 1]));
+        assert!(past_limit([1, 1, u32::MAX]));
+    }
 }
 
 /// Whether `device` is an AMD card's.

@@ -71,6 +71,7 @@ pub fn run(
     let image = if let Some(preset) = fsr {
         anyhow::ensure!(matches!(console, Console::SeriesX), "FSR 4K requires Series X mode");
         fsr_4k::prepare_fsr_4k(&mut prepared, preset)?;
+        fsr_4k::check_host_card()?;
         let dir = cfg.fidelityfx_dir.as_deref().context(
             "FSR 4K requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
         )?;

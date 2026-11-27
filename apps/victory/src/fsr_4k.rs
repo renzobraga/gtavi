@@ -141,6 +141,19 @@ pub(super) fn prepare_fsr_4k(image: &mut PreparedImage, preset: FsrPreset) -> Re
     Ok(())
 }
 
+/// Ends the launch on a host card that cannot have the PC FSR 4 (one that is
+/// not AMD's), saying why and what to do instead, before the DLL is looked
+/// for: else such a card was first sent to fetch a DLL that cannot help it.
+/// `VICTORY_FSR_ANY_PROVIDER=1` lets any card through to the DLL
+/// (`victory_hle::modules::fidelityfx::refused_card`). Makes the host device,
+/// as loading the DLL a moment later would.
+pub(super) fn check_host_card() -> Result<()> {
+    match victory_hle::modules::fidelityfx::refused_card() {
+        Some(why) => Err(anyhow::Error::msg(why)),
+        None => Ok(()),
+    }
+}
+
 fn field<const N: usize>(image: &mut PreparedImage, rva: u32) -> Result<&mut [u8; N]> {
     let offset = image
         .info
