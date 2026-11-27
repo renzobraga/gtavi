@@ -13,7 +13,7 @@
 //! its upload followed by the next texture's aliasing).
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 
 use windows::Win32::Graphics::Direct3D12::*;
 
@@ -44,11 +44,45 @@ pub(crate) struct Rec {
     list: ID3D12GraphicsCommandList,
     any: AtomicBool,
     held: Mutex<Held>,
+    /// Uses of the list since its last reset ([`Rec::recording`]), and the
+    /// most of any recording since its allocator was made: an allocator
+    /// keeps the memory of the most it ever held through its resets
+    /// (`crate::list::recycle` makes it anew when that is far more than it
+    /// holds). Counted with a load and a store, not a locked add: a list is
+    /// recorded by one thread at a time, and a count lost now and then
+    /// changes nothing.
+    calls: AtomicU32,
+    peak: AtomicU32,
 }
 
 impl Rec {
     pub(crate) fn new(list: ID3D12GraphicsCommandList) -> Self {
-        Self { list, any: AtomicBool::new(false), held: Mutex::new(Held(Vec::new())) }
+        Self {
+            list,
+            any: AtomicBool::new(false),
+            held: Mutex::new(Held(Vec::new())),
+            calls: AtomicU32::new(0),
+            peak: AtomicU32::new(0),
+        }
+    }
+
+    /// The uses of the list since its last reset, and the most of any
+    /// recording since its allocator was made (this one's included).
+    pub(crate) fn recording(&self) -> (u32, u32) {
+        let calls = self.calls.load(Relaxed);
+        (calls, self.peak.load(Relaxed).max(calls))
+    }
+
+    /// The list is reset: its recording so far counts towards the most.
+    pub(crate) fn reset_count(&self) {
+        let calls = self.calls.swap(0, Relaxed);
+        self.peak.fetch_max(calls, Relaxed);
+    }
+
+    /// The list's allocator was made anew: it holds nothing yet.
+    pub(crate) fn renewed(&self) {
+        self.calls.store(0, Relaxed);
+        self.peak.store(0, Relaxed);
     }
 
     /// Records `barriers` now, or holds them for the next use of the list.
@@ -120,6 +154,7 @@ impl std::ops::Deref for Rec {
         if self.any.load(Relaxed) {
             self.flush();
         }
+        self.calls.store(self.calls.load(Relaxed).saturating_add(1), Relaxed);
         &self.list
     }
 }

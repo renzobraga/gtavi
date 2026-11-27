@@ -238,8 +238,122 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// profile cpu-1), and the most upload memory they may keep
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const IDLE_MOST: (usize, u64) = (512, 256 << 20);
+
+/// The most host lists kept idle now: [`IDLE_MOST`]'s, or half as many on a
+/// PC of 24 GiB or less (`crate::residency::small_ram_host`) and while the
+/// PC's memory the card shares is at 85 % of its budget
+/// (`crate::residency::shared_high`), where every idle list keeps an
+/// allocator as big as the most it ever recorded (lists' allocators were
+/// 9 GB of a run's private memory on a PC of 64 GB). Not fewer: with 128
+/// lists were thrown away and others made in the same frame.
+#[cfg(windows)]
+pub(crate) fn idle_most() -> usize {
+    idle_most_for(crate::residency::small_ram_host() || crate::residency::shared_high())
+}
+
+#[cfg(any(windows, test))]
+fn idle_most_for(short: bool) -> usize {
+    if short { IDLE_MOST.0 / 2 } else { IDLE_MOST.0 }
+}
+
+/// Whether a host list that ran has its allocator made anew before it is
+/// kept ([`recycle`]): on a PC short of memory (`short`,
+/// `crate::residency::short_of_ram`), when the most uses of the list any
+/// recording made since its allocator was made (`peak`) are over 4,096 and
+/// over eight times those of the recording that ran (`calls`). Idle lists
+/// go round all the title's lists, so every allocator grows to the largest
+/// recording and keeps that memory through its resets.
+/// `VICTORY_LIST_RENEW=0`: never, `=1`: on any PC.
+#[cfg(any(windows, test))]
+fn renews(short: bool, calls: u32, peak: u32) -> bool {
+    short && peak > 4096 && u64::from(peak) > 8 * u64::from(calls)
+}
+
+/// At most this many allocators are made anew in a frame ([`renews`]): a
+/// new one grows again as the next recording asks, and that costs.
+#[cfg(windows)]
+const RENEWED_PER_FRAME: u64 = 4;
+
+/// Whether one more allocator may be made anew in this frame
+/// ([`RENEWED_PER_FRAME`]).
+#[cfg(windows)]
+fn renewal_allowed() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    // The frame in the high bits, the allocators made anew in it in the low 8.
+    static RENEWED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let frame = crate::frame::current();
+    let was = RENEWED.load(Relaxed);
+    let n = if was >> 8 == frame { was & 0xff } else { 0 };
+    n < RENEWED_PER_FRAME && RENEWED.compare_exchange(was, (frame << 8) | (n + 1), Relaxed, Relaxed).is_ok()
+}
+
+/// [`renews`]' `short`: by default whether the PC is short of memory
+/// (`crate::residency::short_of_ram`: of 24 GiB or less, or the memory the
+/// card shares at 70 % of its budget); `VICTORY_LIST_RENEW=1`: on any PC,
+/// `=0`: on none, to measure what it costs and saves.
+#[cfg(windows)]
+fn renewing() -> bool {
+    renew_set().unwrap_or_else(crate::residency::short_of_ram)
+}
+
+/// `VICTORY_LIST_RENEW` ([`renewing`]).
+#[cfg(windows)]
+fn renew_set() -> Option<bool> {
+    static SET: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    *SET.get_or_init(|| match std::env::var("VICTORY_LIST_RENEW").as_deref().map(str::trim) {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    })
+}
+
+/// For the memory plan said at the start: when allocators are made anew
+/// ([`renewing`]), with the PC's memory the card shares followed or not.
+#[cfg(windows)]
+pub(crate) fn renewal_said(followed: bool) -> &'static str {
+    match renew_set() {
+        Some(true) => "always (VICTORY_LIST_RENEW=1)",
+        Some(false) => "never (VICTORY_LIST_RENEW=0)",
+        None if crate::residency::short_of_ram() => "yes",
+        None if followed => "from Watch on",
+        None => "no",
+    }
+}
+
+/// Lets go of the idle host lists past [`idle_most`], the ones that waited
+/// longest first (the sweep, as the PC's memory the card shares enters its
+/// High band; [`recycle`] keeps to it after that).
+#[cfg(windows)]
+pub(crate) fn trim_idle() {
+    let most = idle_most();
+    let gone: Vec<Idle> = {
+        let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+        let over = idle.0.len().saturating_sub(most);
+        let gone: Vec<Idle> = idle.0.drain(..over).collect();
+        idle.1 -= gone.iter().map(|g| g.1).sum::<u64>();
+        gone
+    };
+    // (Freed without the lock.)
+    drop(gone);
+}
+
+/// Lets go of every idle host list, if the pool's lock is free
+/// (`crate::host::emergency_release`): how many went.
+#[cfg(windows)]
+pub(crate) fn release_idle() -> usize {
+    let gone: Vec<Idle> = {
+        let Some(mut idle) = crate::host::tried(&IDLE) else {
+            return 0;
+        };
+        idle.1 = 0;
+        std::mem::take(&mut idle.0)
+    };
+    let n = gone.len();
+    drop(gone);
+    n
+}
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -276,19 +390,34 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
     if !pools() {
         return;
     }
-    for (i, Detached { host, _uploads, _state }) in lists.into_iter().enumerate() {
+    let most = idle_most();
+    for (i, Detached { mut host, _uploads, _state }) in lists.into_iter().enumerate() {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= most {
             continue;
+        }
+        // An allocator that held far more than this recording, on a PC short
+        // of memory, is made anew ([`renews`]): its submission has run, and
+        // the reset below is with the new one.
+        let (calls, peak) = host.list.recording();
+        if renews(renewing(), calls, peak) && renewal_allowed() && host.renew_allocator() {
+            static RENEWALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = RENEWALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                tracing::info!(
+                    "host list allocators made anew since the start (VICTORY_LIST_RENEW=0: none): {n}; the last had held \
+                     {peak} uses of its list, the recording that ran {calls}"
+                );
+            }
         }
         // As the title's reset does: what the list kept for its commands
         // goes, its allocators stay.
         host.reset();
         let bytes = host.scratch_kept();
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        if idle.0.len() < IDLE_MOST.0 && idle.1 + bytes <= IDLE_MOST.1 {
+        if idle.0.len() < most && idle.1 + bytes <= IDLE_MOST.1 {
             idle.0.push(Idle(host, bytes));
             idle.1 += bytes;
         }
@@ -2449,5 +2578,28 @@ mod tests {
         for object in [buffer, list, allocator] {
             assert_eq!(release(object), 0);
         }
+    }
+
+    #[test]
+    fn idle_lists_are_halved_on_a_pc_short_of_memory_but_not_below_256() {
+        assert_eq!(idle_most_for(false), 512);
+        assert_eq!(idle_most_for(true), 256);
+    }
+
+    #[test]
+    fn allocators_are_made_anew_only_when_they_held_far_more() {
+        // A PC with room: never.
+        assert!(!renews(false, 10, 100_000));
+        // An allocator that never held much: kept, however little runs now.
+        assert!(!renews(true, 0, 4096));
+        assert!(renews(true, 0, 4097));
+        // Over eight times this recording's uses, not at eight.
+        assert!(!renews(true, 1000, 8000));
+        assert!(renews(true, 1000, 8001));
+        // The recording that made it so big: kept.
+        assert!(!renews(true, 50_000, 50_000));
+        // No overflow at the top.
+        assert!(!renews(true, u32::MAX, u32::MAX));
+        assert!(renews(true, 1, u32::MAX));
     }
 }

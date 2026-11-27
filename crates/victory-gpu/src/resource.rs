@@ -1754,18 +1754,95 @@ pub(crate) fn host_made<'a>(
 /// Unconditional host-texture floor for a given local VRAM budget (`None` when
 /// the adapter does not report one): up to 2 GiB, capped at a quarter of the
 /// reported budget so 4–6 GiB cards do not bypass the budget check early.
+/// On a small card (12 GiB of budget or less) up to 1 GiB, an eighth of the
+/// budget: 2 GiB of textures made whatever the card holds is more than a
+/// quarter of what a card of 8 GB has once the swap chain and the render
+/// targets are there, and [`room`] then admits them only under the budget.
 #[cfg(any(windows, test))]
 fn texture_floor_bytes(vram_budget: Option<u64>) -> u64 {
     const MAX_FLOOR: u64 = 2 << 30;
     match vram_budget {
+        Some(budget) if small_card(budget) => (MAX_FLOOR / 2).min(budget / 8),
         Some(budget) => MAX_FLOOR.min(budget / 4),
         None => MAX_FLOOR,
     }
 }
 
+/// Whether a card's budget (the system's for its own memory, or the one
+/// `crate::host::effective_budget` makes of it, which `Host::video_memory`
+/// gives) is that of a small card: 12 GiB or less (a card of 8 GB is given
+/// some 7.3 GB). Rules that keep room on the card for one thing or another
+/// were set on cards of 24 GB (and 12 GB before), and keep less on one of
+/// these. (Here, not in `crate::host`, for the tests on any system.)
+///
+/// Decided once for the run, at the first budget the system gives
+/// ([`decide_small_card`]), and only the arithmetic of each rule follows
+/// the budget after that: the budget moves (by some 1 GB at a world's first
+/// frame), and the rules would come and go with it, on a card of 24 GB too
+/// while another program held much of it. Before that, and in the tests,
+/// by `budget` itself.
+#[cfg(any(windows, test))]
+pub(crate) fn small_card(budget: u64) -> bool {
+    #[cfg(not(test))]
+    match SMALL_CARD.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    small_budget(budget)
+}
+
+/// [`small_card`] by `budget` alone.
+#[cfg(any(windows, test))]
+fn small_budget(budget: u64) -> bool {
+    budget > 0 && budget <= 12 << 30
+}
+
+/// [`small_card`]'s verdict for the run: 0 none yet, 1 not a small card,
+/// 2 a small card.
+#[cfg(windows)]
+static SMALL_CARD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Decides [`small_card`] for the run by the first budget of the card's own
+/// memory the system gives that is not 0 (`Host::video_memory`, with
+/// `VICTORY_VRAM_MB`'s cap applied: a card of any size under a cap of
+/// 12 GiB or less is taken for a small one); later calls change nothing.
+#[cfg(windows)]
+pub(crate) fn decide_small_card(budget: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if budget > 0 {
+        let _ = SMALL_CARD.compare_exchange(0, if small_budget(budget) { 2 } else { 1 }, Relaxed, Relaxed);
+    }
+}
+
+/// For the memory plan said at the start: [`texture_floor_bytes`].
+#[cfg(windows)]
+pub(crate) fn texture_floor(vram_budget: Option<u64>) -> u64 {
+    texture_floor_bytes(vram_budget)
+}
+
+/// Whether textures under the floor ([`texture_floor_bytes`]) are made:
+/// always, but on a small card only while the card's memory in use, without
+/// what our own blocks have free (`spare`, asked only then), is under the
+/// budget the system gives (`system`, `crate::host::system_budget`; past it
+/// the system moves memory to the PC's), not the smaller one the layer
+/// works by: those are the textures the title cannot draw without. (0: the
+/// system's is not known, the layer's then.)
+#[cfg(any(windows, test))]
+fn under_floor(filled: u64, memory: Option<[u64; 4]>, system: u64, spare: impl FnOnce() -> u64) -> bool {
+    if filled >= texture_floor_bytes(memory.map(|[budget, ..]| budget)) {
+        return false;
+    }
+    match memory {
+        Some([budget, used, ..]) if small_card(budget) => used.saturating_sub(spare()) < system.max(budget),
+        _ => true,
+    }
+}
+
 /// Whether more host copies of textures the title fills may be made for
-/// shaders that pick textures by index (`draw.rs` `heap_textures`): always
-/// up to [`texture_floor_bytes`] bytes of them, beyond that while the card's
+/// shaders that pick textures by index (`draw.rs` `heap_textures`): up to
+/// [`texture_floor_bytes`] bytes of them always (on a small card while the
+/// card is under the system's budget, [`under_floor`]), beyond that while the card's
 /// memory in use by this process is under nine tenths of the budget the system
 /// gives it ([`room_percent`] says another share; `VICTORY_TEXTURE_BUDGET_MB`
 /// sets a limit on those copies' bytes instead). Past the budget the system moves the card's memory into the PC's,
@@ -1785,8 +1862,7 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
     if let Some(limit) = limit {
         return filled < limit;
     }
-    let floor = texture_floor_bytes(memory.map(|[budget, ..]| budget));
-    if filled < floor {
+    if under_floor(filled, memory, crate::host::system_budget(), crate::pool::texture_room) {
         return true;
     }
     match memory {
@@ -1795,7 +1871,9 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
         // world makes in its first frame ([`targets_room_kept`]) counts as
         // used.
         Some([budget, used, ..]) => {
-            used.saturating_sub(crate::pool::texture_room()) + crate::shadow::card_room_kept() + targets_room_kept()
+            used.saturating_sub(crate::pool::texture_room())
+                + crate::shadow::card_room_kept()
+                + targets_room_kept(Some(budget))
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
@@ -1805,7 +1883,8 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// The bytes of the card's memory the texture queue leaves free for
 /// render targets and other host copies the host itself writes that are
 /// not made yet: `VICTORY_CARD_ROOM_FOR_TARGETS_MB` (3,072; 0: none, as
-/// before) less what such copies hold now.
+/// before; on a small card [`targets_room_most`]) less what such copies
+/// hold now.
 ///
 /// Measured (runs 193, 197, 198): 652 MB of them before the world, 2,255
 /// to 2,352 MB right after its first frame, 2,800 to 3,100 MB two minutes
@@ -1820,18 +1899,40 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 #[cfg(windows)]
-pub(crate) fn targets_room_kept() -> u64 {
+pub(crate) fn targets_room_kept(vram_budget: Option<u64>) -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    let most = *MOST.get_or_init(|| {
+    // Every host texture's bytes less those of the copies the title fills.
+    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
+    targets_room_most(vram_budget).saturating_sub(targets)
+}
+
+/// [`targets_room_kept`] before any target is made: what
+/// `VICTORY_CARD_ROOM_FOR_TARGETS_MB` says, else 3,072 MB, on a small card
+/// (12 GiB of budget or less) at most three tenths of the budget (some
+/// 2,100 MB on a card of 8 GB). 3 GB was measured on a card of 24 GB at
+/// 1440p, and kept that much of a card of 8 GB from the textures from the
+/// start, a third of it before a target was made.
+#[cfg(windows)]
+pub(crate) fn targets_room_most(vram_budget: Option<u64>) -> u64 {
+    static SET: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    let set = *SET.get_or_init(|| {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .map(|mb| mb.min(8192) << 20)
     });
-    // Every host texture's bytes less those of the copies the title fills.
-    let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
-    most.saturating_sub(targets)
+    targets_room_for(vram_budget, set)
+}
+
+/// [`targets_room_most`] for a card budget and the switch's bytes.
+#[cfg(any(windows, test))]
+fn targets_room_for(vram_budget: Option<u64>, set: Option<u64>) -> u64 {
+    const MEASURED: u64 = 3072 << 20;
+    match (set, vram_budget) {
+        (Some(set), _) => set,
+        (None, Some(budget)) if small_card(budget) => MEASURED.min(budget / 10 * 3),
+        _ => MEASURED,
+    }
 }
 
 /// [`room`] as it was at most a tenth of a second ago, for a question
@@ -2137,7 +2238,7 @@ pub(crate) fn let_go_idle() {
         Some([budget, used, ..]) if keep => {
             let used = used.saturating_sub(crate::pool::texture_room())
                 + crate::shadow::card_room_kept()
-                + targets_room_kept();
+                + targets_room_kept(Some(budget));
             crate::host::vram_keep(budget, used)
         }
         _ => (crate::host::vram_idle_ms(memory), u64::MAX),
@@ -4642,12 +4743,59 @@ float4 lit() : SV_Target { return 1.0; }
     fn texture_floor_scales_with_vram_budget() {
         const GIB: u64 = 1 << 30;
         assert_eq!(texture_floor_bytes(None), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB);
-        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 4);
-        assert_eq!(texture_floor_bytes(Some(8 * GIB)), 2 * GIB);
-        assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
+        // Small cards: an eighth of the budget, at most 1 GiB.
+        assert_eq!(texture_floor_bytes(Some(4 * GIB)), GIB / 2);
+        assert_eq!(texture_floor_bytes(Some(6 * GIB)), 6 * GIB / 8);
+        assert_eq!(texture_floor_bytes(Some(8 * GIB)), GIB);
+        assert_eq!(texture_floor_bytes(Some(12 * GIB)), GIB);
+        // Larger ones as before.
+        assert_eq!(texture_floor_bytes(Some(16 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn under_the_floor_a_small_card_still_asks_its_budget() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        let spare = || GIB / 2;
+        let not_asked = || -> u64 { panic!("a large card's blocks are not asked") };
+        // A card of 24 GB: under the floor, always, and its blocks not asked.
+        let big = Some([23 * GIB, 30 * GIB, 0, 0]);
+        assert!(under_floor(GIB, big, 23 * GIB, not_asked));
+        assert!(!under_floor(2 * GIB, big, 23 * GIB, not_asked));
+        // A card of 8 GB: under the floor only under the system's budget,
+        // without what the blocks have free.
+        let (system, layer) = (7_300 * MIB, 6_916 * MIB);
+        let small = |used| Some([layer, used, 0, 0]);
+        assert!(under_floor(GIB / 2, small(6 * GIB), system, spare));
+        assert!(under_floor(GIB / 2, small(7 * GIB), system, spare));
+        // Past the layer's budget, under the system's: still made.
+        assert!(under_floor(GIB / 2, small(7_100 * MIB), 7_300 * MIB, || 0));
+        assert!(!under_floor(GIB / 2, small(7_300 * MIB), 7_300 * MIB, || 0));
+        assert!(!under_floor(GIB / 2, small(7_300 * MIB + GIB / 2), system, spare));
+        assert!(!under_floor(GIB, small(GIB), system, spare), "past the floor");
+        // The system's budget not known: the layer's.
+        assert!(!under_floor(GIB / 2, small(7_000 * MIB), 0, || 0));
+        assert!(under_floor(GIB / 2, small(6_900 * MIB), 0, || 0));
+        // No budget said: as before.
+        assert!(under_floor(GIB, None, 0, not_asked));
+    }
+
+    #[test]
+    fn room_for_render_targets_scales_on_a_small_card() {
+        const MIB: u64 = 1 << 20;
+        const GIB: u64 = 1 << 30;
+        assert_eq!(targets_room_for(None, None), 3072 * MIB);
+        assert_eq!(targets_room_for(Some(23 * GIB), None), 3072 * MIB);
+        assert_eq!(targets_room_for(Some(12 * GIB + 1), None), 3072 * MIB);
+        // Three tenths of a small card's budget, at most 3,072 MB.
+        assert_eq!(targets_room_for(Some(7_000 * MIB), None), 7_000 * MIB / 10 * 3);
+        assert_eq!(targets_room_for(Some(12 * GIB), None), 3072 * MIB);
+        // The switch wins on any card.
+        assert_eq!(targets_room_for(Some(7_000 * MIB), Some(0)), 0);
+        assert_eq!(targets_room_for(Some(23 * GIB), Some(1024 * MIB)), 1024 * MIB);
+        assert_eq!(targets_room_for(Some(7_000 * MIB), Some(3072 * MIB)), 3072 * MIB);
     }
 
     /// A placed texture viewed from a later level has a host copy of that
