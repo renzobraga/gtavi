@@ -600,36 +600,114 @@ unsafe impl Send for Job {}
 
 /// How many workers run the requests, and how many handles a file gets
 /// ([`Io::Handles`]): `VICTORY_DSTORAGE_WORKERS` (1 to 64) if given, else
-/// every logical processor, as before; on a small processor
-/// (`victory_gpu::small_cpu`: under 16 logical ones) its cores less two, at
-/// least 2 (4 on a Ryzen 5 7600X, where it was 12).
-///
-/// They inflate zlib and unpack BCPack on the processor, which the
-/// console's hardware does beside its cores, so a burst of streaming can keep
-/// all of them busy at normal priority beside the title's threads and ours.
-/// With 24 logical processors that left room; with 12, twelve of them could
-/// take every one while a frame waits. They stay at normal priority all
-/// the same: the title's loads wait for them, and a thread below the busy
-/// ones got a processor once in seconds (`super::kernel`'s
-/// `title_priority`). The debug line every 5 s says how many were busy
-/// (`busy_workers`, `bcpack_workers`): near the count while the title
-/// streams, more of them are wanted.
+/// every logical processor, as before. Each reads its request's file with a
+/// call that returns once the bytes are there, so this is also how many
+/// reads are asked of the disk at once; how many inflate or unpack at once
+/// is [`decodes`].
 fn workers() -> usize {
     static WORKERS: OnceLock<usize> = OnceLock::new();
     *WORKERS.get_or_init(|| {
         let asked = std::env::var("VICTORY_DSTORAGE_WORKERS").ok().and_then(|v| v.trim().parse().ok());
-        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let small = victory_gpu::small_cpu();
-        worker_count(asked, logical, small, if small { victory_gpu::physical_cores() } else { 0 })
+        worker_count(asked, std::thread::available_parallelism().map_or(4, |n| n.get()))
     })
 }
 
-/// [`workers`], of `logical` processors and `cores`.
-fn worker_count(asked: Option<usize>, logical: usize, small: bool, cores: usize) -> usize {
+/// [`workers`], of `logical` processors.
+fn worker_count(asked: Option<usize>, logical: usize) -> usize {
+    asked.map_or(logical, |n| n.clamp(1, 64))
+}
+
+/// How many of the [`workers`] may inflate zlib or unpack BCPack at once
+/// ([`decoding`]): `VICTORY_DSTORAGE_DECODES` (1 to 64) if given, else all of
+/// them, as before; on a small processor (`victory_gpu::small_cpu`: under
+/// 16 logical ones) its cores less two, at least 2 (4 on a Ryzen 5 7600X,
+/// of 12 workers). Never more than the workers.
+///
+/// The console's hardware does that work beside its cores; here it is
+/// done on the processor, at normal priority beside the title's threads and
+/// ours, so a burst of streaming could keep every worker at it. With 24
+/// logical processors that left room; with 12, twelve of them could take
+/// every one while a frame waits. The reads before are not counted: a
+/// worker waiting for the disk takes no processor, and the disk is asked
+/// for as many at once as before. They stay at normal priority all the
+/// same: the title's loads wait for them, and a thread below the busy ones
+/// got a processor once in seconds (`super::kernel`'s `title_priority`).
+/// The debug line every 5 s says how many workers were busy, reading and
+/// unpacking BCPack on average (`busy_workers`, `reading_workers`,
+/// `bcpack_workers`) and how many were waiting for a turn here
+/// (`decode_waiting`): well above 0 while the title streams, more turns are
+/// wanted (`VICTORY_DSTORAGE_DECODES=12` there: as before).
+fn decodes() -> usize {
+    static DECODES: OnceLock<usize> = OnceLock::new();
+    *DECODES.get_or_init(|| {
+        let asked = std::env::var("VICTORY_DSTORAGE_DECODES").ok().and_then(|v| v.trim().parse().ok());
+        let small = victory_gpu::small_cpu();
+        let decodes = decode_count(asked, workers(), small, if small { victory_gpu::physical_cores() } else { 0 });
+        if decodes < workers() {
+            tracing::info!(decodes, workers = workers(), "dstorage: so many requests inflate or unpack at once");
+        }
+        decodes
+    })
+}
+
+/// [`decodes`], of `workers` and `cores`.
+fn decode_count(asked: Option<usize>, workers: usize, small: bool, cores: usize) -> usize {
     match asked {
         Some(n) => n.clamp(1, 64),
-        None if small => cores.saturating_sub(2).max(2).min(logical),
-        None => logical,
+        None if small => cores.saturating_sub(2).max(2),
+        None => workers,
+    }
+    .min(workers)
+}
+
+/// Nanoseconds workers spent waiting for a turn to decode, for the debug
+/// summary.
+static DECODE_WAITING: AtomicU64 = AtomicU64::new(0);
+
+/// A turn to inflate or unpack, one of [`decodes`], given back when dropped;
+/// `None` at once where every worker has one (a processor of 16 logical
+/// ones or more, unless asked otherwise).
+fn decoding() -> Option<Turn<'static>> {
+    static DECODING: Turns = Turns::new();
+    let most = decodes();
+    if most >= workers() {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let turn = DECODING.take(most);
+    DECODE_WAITING.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    Some(turn)
+}
+
+/// Turns handed out, so many at once at most ([`Turns::take`]).
+struct Turns {
+    now: Mutex<usize>,
+    given_back: Condvar,
+}
+
+impl Turns {
+    const fn new() -> Turns {
+        Turns { now: Mutex::new(0), given_back: Condvar::new() }
+    }
+
+    /// Waits until fewer than `most` are out, and takes one.
+    fn take(&self, most: usize) -> Turn<'_> {
+        let mut now = self.now.lock().unwrap_or_else(|e| e.into_inner());
+        while *now >= most {
+            now = self.given_back.wait(now).unwrap_or_else(|e| e.into_inner());
+        }
+        *now += 1;
+        Turn(self)
+    }
+}
+
+/// One of [`Turns`], given back when dropped.
+struct Turn<'a>(&'a Turns);
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        *self.0.now.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        self.0.given_back.notify_one();
     }
 }
 
@@ -849,6 +927,7 @@ impl Lanes {
         if elapsed.as_secs() >= 5 {
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
+            let decode_waiting = DECODE_WAITING.swap(0, Ordering::Relaxed) as f64 / 1e9;
             tracing::debug!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),
@@ -857,6 +936,7 @@ impl Lanes {
                 staging_waits = std::mem::take(&mut self.refused),
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
+                decode_waiting = format_args!("{:.2}", decode_waiting / elapsed.as_secs_f64()),
                 waiting,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
@@ -1440,6 +1520,9 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    // So many inflate or unpack at once (`decodes`), the write into the
+    // destination with it; the read above is not counted.
+    let _turn = decoding();
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1803,17 +1886,51 @@ mod tests {
     use crate::modules::xgameruntime::method;
 
     #[test]
-    fn a_small_processor_streams_on_its_cores_less_two() {
-        // The i9-12900K: every logical processor, as before.
-        assert_eq!(worker_count(None, 24, false, 0), 24);
-        // A Ryzen 5 7600X; four cores; two.
-        assert_eq!(worker_count(None, 12, true, 6), 4);
-        assert_eq!(worker_count(None, 8, true, 4), 2);
-        assert_eq!(worker_count(None, 2, true, 2), 2);
-        assert_eq!(worker_count(None, 1, true, 1), 1);
-        // Asked for: that.
-        assert_eq!(worker_count(Some(12), 12, true, 6), 12);
-        assert_eq!(worker_count(Some(0), 24, false, 0), 1);
+    fn a_small_processor_decodes_on_its_cores_less_two() {
+        // Every logical processor reads, unless asked otherwise.
+        assert_eq!(worker_count(None, 24), 24);
+        assert_eq!(worker_count(None, 12), 12);
+        assert_eq!(worker_count(Some(0), 24), 1);
+        assert_eq!(worker_count(Some(100), 12), 64);
+        // The i9-12900K: every worker decodes, as before.
+        assert_eq!(decode_count(None, 24, false, 0), 24);
+        // A Ryzen 5 7600X: four of its twelve; smaller ones two.
+        assert_eq!(decode_count(None, 12, true, 6), 4);
+        assert_eq!(decode_count(None, 8, true, 4), 2);
+        assert_eq!(decode_count(None, 2, true, 2), 2);
+        assert_eq!(decode_count(None, 1, true, 1), 1);
+        // Asked for: that, never more than the workers.
+        assert_eq!(decode_count(Some(12), 12, true, 6), 12);
+        assert_eq!(decode_count(Some(8), 24, false, 0), 8);
+        assert_eq!(decode_count(Some(0), 24, false, 0), 1);
+        assert_eq!(decode_count(Some(12), 4, true, 6), 4);
+    }
+
+    /// Turns are handed out to so many at once, and all given back.
+    #[test]
+    fn turns_go_round_so_many_at_once() {
+        use std::sync::atomic::AtomicUsize;
+        let turns = Turns::new();
+        let (running, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..200 {
+                        let turn = turns.take(3);
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        std::thread::yield_now();
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        drop(turn);
+                    }
+                });
+            }
+        });
+        assert!((1..=3).contains(&most.load(Ordering::SeqCst)));
+        assert_eq!(*turns.now.lock().unwrap(), 0);
+        // One at a time, one after the other.
+        drop(turns.take(1));
+        drop(turns.take(1));
     }
 
     fn call<F: Copy>(object: *mut c_void, slot: usize) -> F {
