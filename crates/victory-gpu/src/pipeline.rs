@@ -187,6 +187,30 @@ impl Shader {
                         "shader does not translate; its pipelines' draws are dropped"
                     ),
                 }
+                // A card of 32-lane waves (NVIDIA) refuses some programs' pipelines; each is named
+                // once (a container is one shader here), with why. Nothing on other cards.
+                if let Ok(t) = &done
+                    && let Some(why) = victory_shader::emit::narrow_refusal(&t.host)
+                {
+                    use victory_shader::emit::NarrowRefusal;
+                    match why {
+                        NarrowRefusal::Wave64 => tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            "refused by a card of 32-lane waves: a console wave64 compute program that \
+                             still needs waves of 64 (VICTORY_WAVE_WHY=1 with `victory translate` says \
+                             why); its dispatches are dropped"
+                        ),
+                        NarrowRefusal::GroupShared(bytes) => tracing::warn!(
+                            stage = self.stage,
+                            hash = %self.hash,
+                            bytes,
+                            "on a card of 32-lane waves: run as two waves of 32 the program needs more \
+                             group-shared memory than the 32 KiB D3D12 names; if its pipeline is refused \
+                             (\"host pipeline refused\"), its dispatches are dropped"
+                        ),
+                    }
+                }
                 done.ok()
             })
             .as_ref()

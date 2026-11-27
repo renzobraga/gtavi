@@ -327,6 +327,12 @@ impl Shader {
         g
     }
 
+    /// The bytes of thread-group shared memory the module declares: those of
+    /// [`Shader::lds`] once it was asked for, else none.
+    pub fn shared_bytes(&self) -> u32 {
+        if self.lds.is_some() { self.lds_dwords * 4 } else { 0 }
+    }
+
     /// Calls `dx.op.<name>` (class and overload) with `opcode` and `args`.
     pub fn op(
         &mut self,

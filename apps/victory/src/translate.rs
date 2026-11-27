@@ -372,6 +372,7 @@ pub fn run(
         "             {} emitted of {} compute programs; {} validated, {} pipelines",
         t.cs_emitted, t.cs_programs, t.cs_validated, t.cs_pipelines
     );
+    narrow_refusals();
     println!(
         "             {} emitted of {} mesh programs; {} validated, {} pipelines",
         t.ms_emitted, t.ms_programs, t.ms_validated, t.ms_pipelines
@@ -405,6 +406,19 @@ pub fn run(
         println!("  {n:>7}  {reason}  (e.g. {example})");
     }
     Ok(())
+}
+
+/// The compute programs translated now that a card of 32-lane waves (NVIDIA)
+/// refuses (`victory_shader::emit::narrow_refusal`), when there are any.
+fn narrow_refusals() {
+    let [wave64, shared] = victory_shader::emit::narrow_refusals();
+    if wave64 + shared > 0 {
+        println!(
+            "             for 32-lane waves {wave64} compute programs still need waves of 64 (their pipelines \
+             are refused) and {shared} more than 32 KiB of group-shared memory (theirs may be); a run's \
+             log names them"
+        );
+    }
 }
 
 /// Every shader found into the cache runs translate from.
@@ -470,6 +484,7 @@ pub fn precompile(paths: Vec<PathBuf>, jobs: Option<usize>, list: Option<PathBuf
         failed.values().map(|f| f.0).sum::<usize>(),
         started.elapsed().as_secs_f64()
     );
+    narrow_refusals();
     let (stale, refreshed, changed) = victory_hle::modules::d3d12x::stale_shaders();
     if stale > 0 {
         println!(

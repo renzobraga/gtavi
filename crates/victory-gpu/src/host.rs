@@ -1049,6 +1049,14 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
+            if o1.WaveLaneCountMax == 32 {
+                tracing::info!(
+                    "this card's waves are of 32 lanes: console wave64 compute programs run as two waves \
+                     of 32 where they can; one that still needs waves of 64, or more than 32 KiB of \
+                     group-shared memory, is named when the title first uses it (\"a card of 32-lane \
+                     waves\")"
+                );
+            }
             victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
