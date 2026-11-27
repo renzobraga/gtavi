@@ -136,6 +136,9 @@ pub(crate) struct HostHeap {
     /// sampler heaps. (Upstream falls back to 2^16 on a capped host heap;
     /// ours keeps 2^18 there: 2^16 and 2^17 both ran out in this title.)
     dynamic: u32,
+    /// A view heap capped at [`PORTABLE_VIEWS`] ([`capped`]): its refused
+    /// tables are counted and told ([`CAPPED_REFUSED`]).
+    capped: bool,
     sampler: bool,
     /// Where the raw twins of the title's slots start
     /// (`victory_shader::emit::raw_views`; 0: there are none), and which of
@@ -1625,6 +1628,25 @@ fn dynamic_slots(count: u32, null: u32) -> u32 {
     null.saturating_sub(count).min(most).max(DYNAMIC)
 }
 
+/// Whether a view heap whose null slot is `null` (0: none) is capped at
+/// [`PORTABLE_VIEWS`] (NVIDIA): its [`DYNAMIC`] slots, a quarter of what a
+/// host without the cap gets, come out of the title's own, and a frame of
+/// the title's bigger places asks for more tables than they hold.
+fn capped(null: u32) -> bool {
+    null != 0 && null < PORTABLE_VIEWS
+}
+
+/// Tables refused for want of free dynamic slots on capped heaps
+/// ([`capped`]) since the start: the draws and dispatches that read them are
+/// dropped. Counted only there.
+static CAPPED_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the `n`th table refused on a capped heap is told: the 1st, the
+/// 10th, the 100th and so on.
+fn told(n: u64) -> bool {
+    n > 0 && 10u64.pow(n.ilog10()) == n
+}
+
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
         let host = host()?;
@@ -1662,6 +1684,7 @@ impl HostHeap {
         };
         let raw = if sampler { 0 } else { victory_shader::emit::raw_views() };
         let extra = if sampler { 0 } else { dynamic_slots(count, null) };
+        let asked = count;
         let (heap, count, size) = if sampler {
             let fitted = count.min(SAMPLERS - 1);
             match make(SAMPLERS) {
@@ -1697,6 +1720,24 @@ impl HostHeap {
                 }
             }
         };
+        let capped = !sampler && capped(null);
+        if capped {
+            // Once a run: how the capped heap is shared out, and how refusals are told.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                tracing::info!(
+                    views = size,
+                    title_slots = count,
+                    title_asked = asked,
+                    dynamic_slots = extra,
+                    "host view heaps are capped at {size} views (this card's most for a shader-visible heap): \
+                     {count} of the title's {asked} slots and {extra} dynamic slots for the tables draws make \
+                     afresh (a card without the cap gets up to {}); a table that finds none free is refused \
+                     and the draws that read it are dropped, which the log counts (the 1st, 10th, 100th, ...)",
+                    DYNAMIC << 2
+                );
+            });
+        }
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
             (
@@ -1737,6 +1778,7 @@ impl HostHeap {
             step,
             count,
             dynamic: extra,
+            capped,
             sampler,
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
@@ -1861,6 +1903,9 @@ impl HostHeap {
     /// [`HostHeap::release`]: the first's index.
     pub(crate) fn dynamic(&self, n: u32) -> Option<u32> {
         if self.sampler || n == 0 || n > self.dynamic {
+            if !self.sampler && n > self.dynamic {
+                self.refused();
+            }
             return None;
         }
         #[cfg(feature = "diagnostics")]
@@ -1899,6 +1944,7 @@ impl HostHeap {
             }
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            self.refused();
             #[cfg(feature = "diagnostics")]
             {
                 use crate::copystat::{C, add};
@@ -1913,6 +1959,24 @@ impl HostHeap {
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// A table [`HostHeap::dynamic`] refused: on a capped heap counted
+    /// ([`CAPPED_REFUSED`]) and told at the 1st, 10th, 100th, ... Nothing
+    /// on others.
+    fn refused(&self) {
+        if !self.capped {
+            return;
+        }
+        let n = CAPPED_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if told(n) {
+            tracing::warn!(
+                refused = n,
+                dynamic_slots = self.dynamic,
+                "tables refused so far for want of free dynamic view slots on a view heap capped at \
+                 {PORTABLE_VIEWS} views: the draws and dispatches that read them are dropped"
+            );
+        }
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -6018,6 +6082,28 @@ mod tests {
         // Long after the last table, a write is due at once.
         heap.queue_texture(2, true, false, frame + 3 + TABLED_FRAMES);
         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+    }
+
+    /// A heap is capped where its null slot is under the portable limit
+    /// (NVIDIA: 999,999), and there it keeps 2^18 dynamic slots whatever the
+    /// title's count; an uncapped one (AMD) is not told.
+    #[test]
+    fn a_capped_view_heap_keeps_the_portable_dynamic_slots() {
+        assert!(capped(PORTABLE_VIEWS - 1));
+        assert!(!capped(UNCAPPED_VIEWS - 1));
+        assert!(!capped(RAW_TWINS - 1));
+        assert!(!capped(0));
+        for count in [4, 720_000, 1_005_000] {
+            assert_eq!(dynamic_slots(count, PORTABLE_VIEWS - 1), DYNAMIC);
+        }
+    }
+
+    #[test]
+    fn refused_tables_are_told_at_each_power_of_ten() {
+        let told_at: Vec<u64> = (0..=100_000).filter(|&n| told(n)).collect();
+        assert_eq!(told_at, [1, 10, 100, 1_000, 10_000, 100_000]);
+        assert!(told(10_000_000_000_000_000_000));
+        assert!(!told(u64::MAX));
     }
 
     #[test]
